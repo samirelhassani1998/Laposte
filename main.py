@@ -23,6 +23,11 @@ from rag_utils import (
     load_file_to_chunks,
     retrieve,
 )
+from token_utils import (
+    count_tokens_chat,
+    truncate_context_text,
+    truncate_messages_to_budget,
+)
 
 load_dotenv()
 
@@ -37,6 +42,9 @@ AVAILABLE_MODELS = [
 
 
 EMBEDDING_MODEL = "text-embedding-3-large"
+MAX_INPUT_TOKENS = 300_000
+RESERVE_OUTPUT_TOKENS = 1_000
+MAX_RAG_CONTEXT_TOKENS = 30_000
 RETRIEVAL_K = 4
 MAX_FILES = 5
 MAX_FILE_BYTES = DEFAULT_MAX_FILE_MB * 1024 * 1024
@@ -64,8 +72,6 @@ def _init_session_state() -> None:
         st.session_state.rag_embedding_model = EMBEDDING_MODEL
     if "chat_attachments" not in st.session_state:
         st.session_state.chat_attachments = []
-    if "chat_input" not in st.session_state:
-        st.session_state.chat_input = ""
 
 
 def _reset_chat() -> None:
@@ -519,47 +525,48 @@ def _render_chat_interface() -> None:
     if "chat_attachments" not in st.session_state:
         st.session_state.chat_attachments = []
 
-    c1, c2, c3 = st.columns([0.08, 0.72, 0.20])
-    with c1:
-        with st.popover("📎", use_container_width=True):
-            files = st.file_uploader(
-                "Importer des fichiers",
-                type=["csv", "tsv", "xlsx", "xls", "pdf", "docx", "txt", "md"],
-                accept_multiple_files=True,
-            )
-            help_hint = (
-                f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, XLSX, XLS, PDF, DOCX, TXT, MD"
-            )
-            if ALLOW_LARGE_FILES:
-                help_hint += " — Les fichiers plus lourds seront traités par morceaux."
-            st.caption(help_hint)
-            if files:
-                # ajoute sans dupliquer les mêmes noms+taille
-                existing = {(f.name, f.size) for f in st.session_state.chat_attachments}
-                for f in files:
-                    if (f.name, f.size) not in existing:
-                        if len(st.session_state.chat_attachments) >= MAX_FILES:
-                            st.warning(f"Maximum {MAX_FILES} fichiers par envoi.")
-                            break
-                        size = getattr(f, "size", None)
-                        if size is None:
-                            size = len(f.getvalue())
-                        if not ALLOW_LARGE_FILES and size > MAX_FILE_BYTES:
-                            st.warning(
-                                f"{f.name} dépasse la limite de {DEFAULT_MAX_FILE_MB} Mo et sera ignoré."
-                            )
-                            continue
-                        st.session_state.chat_attachments.append(f)
+    with st.form("chat-composer", clear_on_submit=True):
+        c1, c2, c3 = st.columns([0.08, 0.72, 0.20])
+        with c1:
+            with st.popover("📎", use_container_width=True):
+                files = st.file_uploader(
+                    "Importer des fichiers",
+                    type=["csv", "tsv", "xlsx", "xls", "pdf", "docx", "txt", "md"],
+                    accept_multiple_files=True,
+                )
+                help_hint = (
+                    f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, XLSX, XLS, PDF, DOCX, TXT, MD"
+                )
+                if ALLOW_LARGE_FILES:
+                    help_hint += " — Les fichiers plus lourds seront traités par morceaux."
+                st.caption(help_hint)
+                if files:
+                    # ajoute sans dupliquer les mêmes noms+taille
+                    existing = {(f.name, f.size) for f in st.session_state.chat_attachments}
+                    for f in files:
+                        if (f.name, f.size) not in existing:
+                            if len(st.session_state.chat_attachments) >= MAX_FILES:
+                                st.warning(f"Maximum {MAX_FILES} fichiers par envoi.")
+                                break
+                            size = getattr(f, "size", None)
+                            if size is None:
+                                size = len(f.getvalue())
+                            if not ALLOW_LARGE_FILES and size > MAX_FILE_BYTES:
+                                st.warning(
+                                    f"{f.name} dépasse la limite de {DEFAULT_MAX_FILE_MB} Mo et sera ignoré."
+                                )
+                                continue
+                            st.session_state.chat_attachments.append(f)
 
-    with c2:
-        user_text = st.text_input(
-            "Envoyer un message…",
-            label_visibility="collapsed",
-            key="chat_input",
-        )
+        with c2:
+            user_text = st.text_input(
+                "Envoyer un message…",
+                label_visibility="collapsed",
+                key="chat_input",
+            )
 
-    with c3:
-        send = st.button("▶️ Envoyer", use_container_width=True)
+        with c3:
+            send = st.form_submit_button("▶️ Envoyer", use_container_width=True)
 
     if st.session_state.chat_attachments:
         chip_cols = st.columns(min(len(st.session_state.chat_attachments), 4))
@@ -683,20 +690,43 @@ def _render_chat_interface() -> None:
                 st.warning(f"Recherche contextuelle indisponible : {error}")
                 hits = []
 
+        truncated_context_flag = False
+        truncated_history_flag = False
+        selected_model = st.session_state.selected_model
+
         if hits:
             context = format_context(hits)
+            trimmed_context = truncate_context_text(
+                context,
+                selected_model,
+                MAX_RAG_CONTEXT_TOKENS,
+            )
+            truncated_context_flag = trimmed_context != context
             sys_prefix = {
                 "role": "system",
                 "content": (
                     "Tu es un assistant. Utilise EXCLUSIVEMENT les extraits ci-dessous pour répondre. "
                     "Cites les sources entre crochets [n]. Si l’info manque, dis-le.\n\nExtraits :\n"
-                    + context
+                    + trimmed_context
                 ),
             }
             messages_for_api = [sys_prefix] + messages_for_api
             sources_info = _build_source_entries(hits)
 
+        original_prompt_tokens = count_tokens_chat(messages_for_api, selected_model)
+        messages_for_api = truncate_messages_to_budget(
+            messages_for_api,
+            selected_model,
+            MAX_INPUT_TOKENS,
+            RESERVE_OUTPUT_TOKENS,
+        )
+        truncated_history_flag = (
+            count_tokens_chat(messages_for_api, selected_model) < original_prompt_tokens
+        )
+
         with st.chat_message("assistant"):
+            if truncated_context_flag or truncated_history_flag:
+                st.caption("ℹ️ Contexte réduit pour respecter les limites du modèle.")
             status_box = st.empty()
             answer_box = st.empty()
             sources_placeholder = st.empty()
@@ -752,8 +782,6 @@ def _render_chat_interface() -> None:
                         "sources": sources_info if sources_info else None,
                     }
                 )
-
-        st.session_state.chat_input = ""
         st.rerun()
 
 

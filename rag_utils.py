@@ -15,6 +15,7 @@ from openai import OpenAI
 
 import chardet
 import streamlit as st
+from token_utils import count_tokens_text, truncate_context_text
 
 try:  # pragma: no cover - handled gracefully at runtime
     import faiss
@@ -142,6 +143,7 @@ def read_pdf_paged(file_bytes: bytes) -> List[Tuple[str, Dict[str, Any]]]:
     return pages
 
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-large"
+EMBED_MAX_TOKENS_PER_REQUEST = 300_000
 CHAT_MAX_FILES = 5
 CHAT_MAX_FILE_SIZE = DEFAULT_MAX_FILE_MB * 1024 * 1024
 
@@ -174,6 +176,14 @@ def clear_status_callbacks() -> None:
 class DocumentChunk:
     text: str
     meta: Dict[str, Any]
+
+
+class TokenBatch(list):
+    """List-like container that tracks whether any item was truncated."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.truncated = False
 
 
 def _clean_text(text: str) -> str:
@@ -631,12 +641,60 @@ def index_files_from_chat(files: Sequence[Any]) -> Dict[str, Any]:
     }
 
 
+def batch_by_token_budget(texts: Sequence[str], model: str, max_tokens: int):
+    """Yield batches of texts whose combined tokens stay under the budget."""
+
+    if max_tokens <= 0:
+        for text in texts:
+            batch = TokenBatch()
+            current = truncate_context_text(text or "", model, 0)
+            if current != (text or ""):
+                batch.truncated = True
+            batch.append(current)
+            yield batch
+        return
+
+    batch = TokenBatch()
+    total = 0
+    for text in texts:
+        current = text or ""
+        token_count = count_tokens_text(current, model)
+        truncated = False
+        if token_count > max_tokens:
+            current = truncate_context_text(current, model, max_tokens)
+            truncated = current != (text or "")
+            token_count = count_tokens_text(current, model)
+        if total + token_count > max_tokens and batch:
+            yield batch
+            batch = TokenBatch()
+            total = 0
+        batch.append(current)
+        total += token_count
+        if truncated:
+            batch.truncated = True
+    if batch:
+        yield batch
+
+
 def embed_texts(client: OpenAI, model: str, texts: Sequence[str]) -> np.ndarray:
     if not texts:
         return np.empty((0, 0), dtype=np.float32)
 
-    response = client.embeddings.create(model=model, input=list(texts))
-    embeddings = np.array([item.embedding for item in response.data], dtype=np.float32)
+    vectors: List[List[float]] = []
+    truncated_any = False
+
+    for batch in batch_by_token_budget(texts, model, EMBED_MAX_TOKENS_PER_REQUEST):
+        truncated_any = truncated_any or getattr(batch, "truncated", False)
+        response = client.embeddings.create(model=model, input=list(batch))
+        vectors.extend(item.embedding for item in response.data)
+
+    if truncated_any:
+        st.warning("Document volumineux compressé pour rester sous la limite de tokens.")
+
+    if not vectors:
+        return np.empty((0, 0), dtype=np.float32)
+
+    embeddings = np.array(vectors, dtype=np.float32)
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     normalized = embeddings / norms
