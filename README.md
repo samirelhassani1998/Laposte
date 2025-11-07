@@ -41,6 +41,18 @@ If you do not want to type your API key every time, you can create a `.env` file
 - Update the list of models in `main.py` to match the ones available on your account.
 - Adjust the theme colors in `.streamlit/config.toml` to tweak the look and feel.
 
+## RAG & Upload
+
+The chat interface now includes an optional retrieval-augmented generation (RAG) workflow:
+
+- **Drag & drop documents** directly in the sidebar (`csv`, `xlsx`, `xls`, `pdf`, `docx`, `txt`, `md`). Up to five files at a time and 20&nbsp;MB per file are accepted.
+- **On-demand indexing** builds an in-memory FAISS index for the current session using OpenAI's `text-embedding-3-large` model. Files are read in memory only; nothing is persisted on disk and the API key never leaves the session.
+- **Chunking & metadata**: each document is normalized, chunked (~4 000 chars with 400-char overlap), and enriched with metadata (source file, page/sheet/row range when applicable).
+- **Contextual answers**: when the index is populated, every new user question retrieves the top-4 chunks and injects them into the system prompt. Responses cite their sources and a badge indicates when RAG is active.
+- **Reset anytime**: use the “Réinitialiser base” button to clear the FAISS index and associated documents from the session state.
+
+The sidebar summarises the indexed corpus (file sizes, estimated tokens, chunk counts, embedding model). If a PDF contains no extractable text (e.g. scanned documents), the app warns you and skips it.
+
 ## License
 
 This project is released under the [MIT License](LICENSE).

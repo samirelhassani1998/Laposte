@@ -1,11 +1,21 @@
 import os
 import re
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from rag_utils import (
+    FAISS_IMPORT_ERROR,
+    add_embeddings_to_index,
+    embed_texts,
+    format_context,
+    format_source_badge,
+    human_readable_size,
+    load_file_to_chunks,
+    retrieve,
+)
 
 load_dotenv()
 
@@ -19,6 +29,14 @@ AVAILABLE_MODELS = [
 ]
 
 
+EMBEDDING_MODEL = "text-embedding-3-large"
+RETRIEVAL_K = 4
+MAX_FILES = 5
+MAX_FILE_SIZE = 20 * 1024 * 1024
+CHUNK_MAX_CHARS = 4000
+CHUNK_OVERLAP = 400
+
+
 def _init_session_state() -> None:
     if "api_key" not in st.session_state:
         env_key = os.getenv("OPENAI_API_KEY")
@@ -27,16 +45,163 @@ def _init_session_state() -> None:
         st.session_state.messages = []
     if "selected_model" not in st.session_state:
         st.session_state.selected_model = AVAILABLE_MODELS[0]
+    if "rag_index" not in st.session_state:
+        st.session_state.rag_index = None
+    if "rag_texts" not in st.session_state:
+        st.session_state.rag_texts = []
+    if "rag_meta" not in st.session_state:
+        st.session_state.rag_meta = []
+    if "rag_docs" not in st.session_state:
+        st.session_state.rag_docs = []
+    if "rag_embedding_model" not in st.session_state:
+        st.session_state.rag_embedding_model = EMBEDDING_MODEL
 
 
 def _reset_chat() -> None:
     st.session_state.messages = []
 
 
+def _reset_rag_state() -> None:
+    st.session_state.rag_index = None
+    st.session_state.rag_texts = []
+    st.session_state.rag_meta = []
+    st.session_state.rag_docs = []
+    st.session_state.rag_embedding_model = EMBEDDING_MODEL
+
+
 def _remove_api_key() -> None:
     st.session_state.api_key = None
     _reset_chat()
+    _reset_rag_state()
     st.rerun()
+
+
+def _rag_is_ready() -> bool:
+    return bool(st.session_state.rag_index is not None and st.session_state.rag_texts)
+
+
+def _format_sources_line(sources: Sequence[Dict[str, Any]]) -> str:
+    if not sources:
+        return ""
+    badges = [format_source_badge(entry["meta"], entry["index"]) for entry in sources]
+    return "Sources : " + ", ".join(badges)
+
+
+def _build_source_entries(hits: Sequence[Sequence[Any]]) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    for idx, hit in enumerate(hits, start=1):
+        _, meta, score = hit
+        entries.append({"index": idx, "meta": meta, "score": score})
+    return entries
+
+
+def _handle_indexing(uploaded_files: Sequence[Any]) -> None:
+    if not uploaded_files:
+        return
+
+    if FAISS_IMPORT_ERROR is not None:
+        st.error(f"faiss-cpu est requis pour activer le RAG : {FAISS_IMPORT_ERROR}")
+        return
+
+    if len(uploaded_files) > MAX_FILES:
+        st.warning(f"Merci de limiter l'indexation à {MAX_FILES} fichiers simultanés.")
+        return
+
+    oversized: List[str] = []
+    valid_files = []
+    for uploaded_file in uploaded_files:
+        size = getattr(uploaded_file, "size", None)
+        if size is None:
+            try:
+                size = len(uploaded_file.getvalue())
+            except Exception:
+                size = 0
+        if size and size > MAX_FILE_SIZE:
+            oversized.append(uploaded_file.name)
+            continue
+        valid_files.append(uploaded_file)
+
+    if oversized:
+        st.warning(
+            "\n".join(
+                [
+                    "Les fichiers suivants dépassent 20 Mo et ont été ignorés :",
+                    *[f"• {name}" for name in oversized],
+                ]
+            )
+        )
+
+    if not valid_files:
+        st.info("Aucun fichier indexé.")
+        return
+
+    with st.status("Indexation en cours…", expanded=False) as status:
+        status.update(label="📥 Lecture des fichiers…", state="running")
+        chunk_texts: List[str] = []
+        chunk_metas: List[Dict[str, Any]] = []
+        doc_summaries: List[Dict[str, Any]] = []
+        ingestion_warnings: List[str] = []
+
+        for uploaded_file in valid_files:
+            try:
+                chunks, summary, warnings = load_file_to_chunks(
+                    uploaded_file,
+                    max_chars=CHUNK_MAX_CHARS,
+                    overlap=CHUNK_OVERLAP,
+                )
+            except Exception as exc:  # noqa: BLE001 - surface in UI
+                ingestion_warnings.append(f"{uploaded_file.name} : {exc}")
+                continue
+
+            if summary:
+                doc_summaries.append(summary)
+            if warnings:
+                ingestion_warnings.extend(warnings)
+            if not chunks:
+                status.write(f"⚠️ {uploaded_file.name} — aucun texte exploitable.")
+                continue
+
+            status.write(f"✔️ {uploaded_file.name} — {len(chunks)} chunks")
+            for chunk in chunks:
+                chunk_texts.append(chunk.text)
+                chunk_metas.append(chunk.meta)
+
+        if not chunk_texts:
+            status.update(label="⚠️ Aucun contenu indexable", state="error")
+            for warn in ingestion_warnings:
+                st.warning(warn)
+            return
+
+        status.update(label="🧠 Calcul des embeddings…", state="running")
+        client = OpenAI(api_key=st.session_state.api_key)
+        embedding_model = st.session_state.rag_embedding_model or EMBEDDING_MODEL
+        embeddings = embed_texts(client, embedding_model, chunk_texts)
+
+        if embeddings.size == 0:
+            status.update(label="⚠️ Impossible de calculer les embeddings", state="error")
+            return
+
+        status.update(label="📚 Construction de l'index FAISS…", state="running")
+        try:
+            st.session_state.rag_index = add_embeddings_to_index(
+                st.session_state.rag_index,
+                embeddings,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface in UI
+            status.update(label="❌ Échec de la mise à jour de l'index", state="error")
+            st.error(f"Impossible de mettre à jour l'index FAISS : {exc}")
+            return
+
+        st.session_state.rag_texts.extend(chunk_texts)
+        st.session_state.rag_meta.extend(chunk_metas)
+        st.session_state.rag_docs.extend(doc_summaries)
+        st.session_state.rag_embedding_model = embedding_model
+
+        status.update(label="✅ Indexation terminée", state="complete")
+
+    st.success(f"{len(chunk_texts)} nouveaux chunks ont été ajoutés à la base documentaire.")
+    for warn in ingestion_warnings:
+        st.warning(warn)
 
 
 def _render_key_gate() -> None:
@@ -94,7 +259,7 @@ def _render_key_gate() -> None:
 
 
 
-def _render_sidebar() -> None:
+def _render_sidebar() -> Dict[str, Any]:
     with st.sidebar:
         st.markdown("### Paramètres")
         try:
@@ -110,9 +275,55 @@ def _render_sidebar() -> None:
         st.markdown("---")
         st.caption("Votre clé n'est jamais sauvegardée côté serveur.")
 
+        st.markdown("### Données")
+        uploaded_files = st.file_uploader(
+            "📎 Importer des fichiers",
+            type=["csv", "xlsx", "xls", "pdf", "docx", "txt", "md"],
+            accept_multiple_files=True,
+        )
+        if uploaded_files:
+            st.caption("Jusqu'à 5 fichiers, 20 Mo max chacun.")
 
-def _call_openai(messages: List[Dict[str, str]]):
-    client = OpenAI(api_key=st.session_state.api_key)
+        index_clicked = st.button(
+            "Indexer",
+            use_container_width=True,
+            disabled=not uploaded_files,
+        )
+        reset_clicked = st.button(
+            "Réinitialiser base",
+            use_container_width=True,
+        )
+
+        st.markdown("---")
+        doc_count = len(st.session_state.rag_docs)
+        chunk_count = len(st.session_state.rag_texts)
+        st.markdown(f"**Documents indexés :** {doc_count}")
+        st.markdown(f"**Chunks :** {chunk_count}")
+        st.markdown(f"**Modèle d'embeddings :** {st.session_state.rag_embedding_model or '-'}")
+
+        if st.session_state.rag_docs:
+            for doc in st.session_state.rag_docs:
+                st.caption(
+                    " • ".join(
+                        [
+                            doc.get("name", "Inconnu"),
+                            human_readable_size(doc.get("size_bytes", 0)),
+                            f"{doc.get('chunk_count', 0)} chunks",
+                            f"~{doc.get('token_estimate', 0)} tokens",
+                        ]
+                    )
+                )
+        else:
+            st.caption("Aucun document indexé.")
+
+    return {
+        "uploaded_files": uploaded_files,
+        "index_clicked": index_clicked,
+        "reset_clicked": reset_clicked,
+    }
+
+
+def _call_openai(client: OpenAI, messages: List[Dict[str, str]]):
     return client.chat.completions.create(
         model=st.session_state.selected_model,
         messages=messages,
@@ -180,7 +391,14 @@ def _render_message_content(content: str) -> None:
 
 
 def _render_chat_interface() -> None:
-    _render_sidebar()
+    sidebar_state = _render_sidebar()
+
+    if sidebar_state["reset_clicked"]:
+        _reset_rag_state()
+        st.sidebar.success("Base documentaire réinitialisée.")
+
+    if sidebar_state["index_clicked"]:
+        _handle_indexing(sidebar_state["uploaded_files"] or [])
 
     st.markdown(
         """
@@ -229,9 +447,15 @@ def _render_chat_interface() -> None:
 
     st.markdown("<div class='chat-header'>ChatGPT-like Chatbot</div>", unsafe_allow_html=True)
 
+    if _rag_is_ready():
+        st.markdown(f"🧠 **RAG actif** (k={RETRIEVAL_K})")
+
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             _render_message_content(message.get("content", ""))
+            sources_line = _format_sources_line(message.get("sources") or [])
+            if sources_line:
+                st.caption(sources_line)
             usage_text = _format_usage(message.get("usage"))
             if usage_text:
                 st.caption(usage_text)
@@ -242,7 +466,7 @@ def _render_chat_interface() -> None:
             <div class='empty-state'>
                 <h2>Que voulez-vous savoir aujourd'hui ?</h2>
                 <p>Choisissez un modèle dans la barre latérale et lancez la discussion.</p>
-                <p>Votre historique reste visible dans cette fenêtre, comme sur ChatGPT.</p>
+                <p>Déposez vos fichiers dans la barre latérale pour activer le RAG.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -259,9 +483,39 @@ def _render_chat_interface() -> None:
             {"role": msg["role"], "content": msg["content"]} for msg in st.session_state.messages
         ]
 
+        client = OpenAI(api_key=st.session_state.api_key)
+        rag_hits: List[Any] = []
+        sources_info: List[Dict[str, Any]] = []
+
+        if _rag_is_ready():
+            try:
+                rag_hits = retrieve(
+                    client,
+                    user_message,
+                    st.session_state.rag_index,
+                    st.session_state.rag_texts,
+                    st.session_state.rag_meta,
+                    st.session_state.rag_embedding_model or EMBEDDING_MODEL,
+                    k=RETRIEVAL_K,
+                )
+            except Exception as error:  # noqa: BLE001 - surface gracefully
+                st.warning(f"Recherche contextuelle indisponible : {error}")
+                rag_hits = []
+
+        if rag_hits:
+            context = format_context(rag_hits)
+            system_prompt = (
+                "Tu es un assistant. Utilise EXCLUSIVEMENT les extraits ci-dessous pour répondre. "
+                "Cites les sources entre crochets [n] lorsque pertinent. Si l’info manque, dis-le.\n"
+                f"Extraits :\n{context}"
+            )
+            messages_for_api = [{"role": "system", "content": system_prompt}] + messages_for_api
+            sources_info = _build_source_entries(rag_hits)
+
         with st.chat_message("assistant"):
             status_box = st.empty()
             answer_box = st.empty()
+            sources_placeholder = st.empty()
             usage_placeholder = st.empty()
 
             status_box.info("✍️ L’assistant est en train d’écrire…")
@@ -271,7 +525,7 @@ def _render_chat_interface() -> None:
             first_token_displayed = False
 
             try:
-                for chunk in _call_openai(messages_for_api):
+                for chunk in _call_openai(client, messages_for_api):
                     if chunk.choices and chunk.choices[0].delta:
                         content = chunk.choices[0].delta.content or ""
                         if content:
@@ -289,11 +543,19 @@ def _render_chat_interface() -> None:
                 status_box.empty()
                 answer_box.empty()
                 _render_message_content(response_text)
+                sources_line = _format_sources_line(sources_info)
+                if sources_line:
+                    sources_placeholder.caption(sources_line)
                 usage_text = _format_usage(usage_data)
                 if usage_text:
                     usage_placeholder.caption(usage_text)
                 st.session_state.messages.append(
-                    {"role": "assistant", "content": response_text, "usage": usage_data}
+                    {
+                        "role": "assistant",
+                        "content": response_text,
+                        "usage": usage_data,
+                        "sources": sources_info if sources_info else None,
+                    }
                 )
 
 
