@@ -1,10 +1,22 @@
+# Python
 __pycache__/
 *.py[cod]
-*.env
-.venv/
-.env.local
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+
+# Streamlit
+.streamlit/config.toml.local
 .streamlit/secrets.toml
+
+# Environments
+.env
+.venv/
+venv/
+ENV/
+
+# OS
 .DS_Store
-.idea/
-.vscode/
-*.log
+Thumbs.db

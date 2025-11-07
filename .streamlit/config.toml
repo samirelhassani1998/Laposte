@@ -1,9 +1,9 @@
 [theme]
-primaryColor = "#0C6CF2"
-backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F5F7FB"
-textColor = "#0C0C0C"
-font = "sans serif"
+primaryColor = "#10a37f"
+backgroundColor = "#f7f7f8"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#111827"
+font = "Inter"
 
-[server]
-headless = true
+[client]
+showSidebarNavigation = false
