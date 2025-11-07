@@ -2,6 +2,7 @@ import os
 import re
 from html import escape
 from typing import Any, Dict, List, Optional, Sequence
+from types import SimpleNamespace
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -77,6 +78,10 @@ def _init_session_state() -> None:
         st.session_state.chat_attachments = []
     if "chat_images" not in st.session_state:
         st.session_state.chat_images = []
+    if "show_logs" not in st.session_state:
+        st.session_state.show_logs = False
+    if "last_call_log" not in st.session_state:
+        st.session_state.last_call_log = None
 
 
 def _reset_chat() -> None:
@@ -352,20 +357,76 @@ def _render_sidebar() -> Dict[str, Any]:
         else:
             st.caption("Aucun document indexé.")
 
+        st.markdown("---")
+        show_logs = st.checkbox(
+            "Afficher les logs",
+            value=st.session_state.show_logs,
+        )
+        st.session_state.show_logs = show_logs
+        if show_logs:
+            st.markdown("### Logs")
+            log = st.session_state.last_call_log
+            if not log:
+                st.caption("Aucun appel récent.")
+            else:
+                lines: List[str] = []
+                lines.append(f"- **Modèle :** {log.get('model', '-')}")
+                lines.append(f"- **Type d’appel :** {log.get('call_type', '-')}")
+                lines.append(
+                    f"- **Messages envoyés :** {log.get('messages_count', 0)}"
+                )
+                tokens_before = log.get("prompt_tokens_before")
+                tokens_after = log.get("prompt_tokens_after")
+                if tokens_before and tokens_before != tokens_after:
+                    lines.append(
+                        f"- **Tokens invite (avant/après) :** {tokens_before} → {tokens_after}"
+                    )
+                elif tokens_after is not None:
+                    lines.append(f"- **Tokens invite estimés :** {tokens_after}")
+                lines.append(
+                    f"- **RAG :** {'oui' if log.get('rag_used') else 'non'}"
+                )
+                if log.get("rag_hits"):
+                    lines.append(f"  - {log['rag_hits']} extraits")
+                if log.get("truncated_context"):
+                    lines.append("  - Contexte RAG tronqué")
+                if log.get("truncated_history"):
+                    lines.append("  - Historique tronqué")
+                image_count = log.get("image_count", 0)
+                lines.append(f"- **Images :** {image_count}")
+                images = log.get("images") or []
+                for image in images:
+                    name = image.get("name") or "Image"
+                    size_bytes = image.get("size_bytes") or 0
+                    lines.append(
+                        f"  - {escape(name)} ({human_readable_size(size_bytes)})"
+                    )
+                attachments_count = log.get("attachments_count")
+                if attachments_count is not None:
+                    lines.append(f"- **Pièces jointes indexées :** {attachments_count}")
+                usage_text = _format_usage(log.get("usage"))
+                if usage_text:
+                    lines.append(f"- {usage_text}")
+                response_chars = log.get("response_chars")
+                if response_chars is not None:
+                    lines.append(
+                        f"- **Longueur réponse :** {response_chars} caractères"
+                    )
+                if log.get("sources_count"):
+                    lines.append(f"- **Sources citées :** {log['sources_count']}")
+                if log.get("error"):
+                    lines.append(f"- **Erreur :** {log['error']}")
+                st.markdown("\n".join(lines))
+                if log.get("error"):
+                    st.caption(
+                        "[Voir logs Streamlit Cloud](https://docs.streamlit.io/deploy/streamlit-community-cloud/get-started/manage-your-app#view-your-app-logs)"
+                    )
+
     return {
         "uploaded_files": uploaded_files,
         "index_clicked": index_clicked,
         "reset_clicked": reset_clicked,
     }
-
-
-def _call_openai(client: OpenAI, messages: List[Dict[str, str]]):
-    return client.chat.completions.create(
-        model=st.session_state.selected_model,
-        messages=messages,
-        stream=True,
-        stream_options={"include_usage": True},
-    )
 
 
 def _usage_to_dict(usage: Optional[object]) -> Optional[Dict[str, int]]:
@@ -397,6 +458,106 @@ def _format_usage(usage: Optional[Dict[str, int]]) -> Optional[str]:
         return None
 
     return "Usage tokens — " + ", ".join(parts)
+
+
+def stream_via_responses(
+    client: OpenAI,
+    model: str,
+    payload_messages: Sequence[Dict[str, Any]],
+    on_delta,
+    on_done,
+    on_error,
+) -> None:
+    try:
+        with client.responses.stream(
+            model=model,
+            input=payload_messages,
+        ) as stream:
+            for event in stream:
+                try:
+                    if event.type == "response.output_text.delta":
+                        on_delta(getattr(event, "delta", ""))
+                    elif event.type == "response.error":
+                        on_error(getattr(event, "error", "Erreur inconnue"))
+                        return
+                except Exception as inner_exc:  # noqa: BLE001 - propagate to UI
+                    on_error(inner_exc)
+                    return
+            try:
+                result = stream.get_final_response()
+            except Exception as final_exc:  # noqa: BLE001 - propagate to UI
+                on_error(final_exc)
+                return
+            on_done(result)
+    except Exception as exc:  # noqa: BLE001 - surface to UI
+        on_error(exc)
+
+
+def stream_via_chat_completions(
+    client: OpenAI,
+    model: str,
+    payload_messages: Sequence[Dict[str, Any]],
+    on_delta,
+    on_done,
+    on_error,
+) -> None:
+    try:
+        stream = client.chat.completions.create(
+            model=model,
+            messages=payload_messages,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        final_parts: List[str] = []
+        usage_data = None
+        for chunk in stream:
+            try:
+                choice = chunk.choices[0] if chunk.choices else None
+                delta = getattr(choice.delta, "content", None) if choice else None
+            except AttributeError:
+                delta = None
+            if delta:
+                final_parts.append(delta)
+                try:
+                    on_delta(delta)
+                except Exception as inner_exc:  # noqa: BLE001
+                    on_error(inner_exc)
+                    return
+            if getattr(chunk, "usage", None):
+                usage_data = chunk.usage
+        result = SimpleNamespace(output_text="".join(final_parts), usage=usage_data)
+        on_done(result)
+    except Exception as exc:  # noqa: BLE001 - surface to UI
+        on_error(exc)
+
+
+def call_llm(
+    client: OpenAI,
+    model: str,
+    payload_messages: Sequence[Dict[str, Any]],
+    on_delta,
+    on_done,
+    on_error,
+) -> None:
+    last_user = next(
+        (message for message in reversed(payload_messages) if message.get("role") == "user"),
+        None,
+    )
+    is_multimodal = isinstance(last_user.get("content") if last_user else None, list)
+
+    vision_capable = {"gpt-4o", "gpt-4o-mini", "gpt-5"}
+    if is_multimodal and model not in vision_capable:
+        on_error(
+            ValueError(
+                "Ce modèle n’accepte pas d’images. Choisissez gpt-4o / gpt-4o-mini / gpt-5."
+            )
+        )
+        return
+
+    if is_multimodal:
+        stream_via_responses(client, model, payload_messages, on_delta, on_done, on_error)
+    else:
+        stream_via_chat_completions(client, model, payload_messages, on_delta, on_done, on_error)
 
 
 CODE_BLOCK_PATTERN = re.compile(r"```([\w+-]*)\n(.*?)```", re.DOTALL)
@@ -440,6 +601,37 @@ def _render_message_content(content: Any) -> None:
 
 
 def _render_chat_interface() -> None:
+    def _extract_text_from_response_output(output: Any) -> str:
+        if not output:
+            return ""
+        pieces: List[str] = []
+        for item in output:
+            if isinstance(item, dict):
+                content_items = item.get("content") or []
+            else:
+                content_items = getattr(item, "content", None) or []
+            if not isinstance(content_items, list):
+                content_items = [content_items]
+            for content_item in content_items:
+                text_value = None
+                if isinstance(content_item, dict):
+                    text_value = content_item.get("text") or content_item.get("value")
+                else:
+                    text_value = getattr(content_item, "text", None) or getattr(
+                        content_item, "value", None
+                    )
+                if isinstance(text_value, dict):
+                    text_value = text_value.get("value") or text_value.get("text")
+                if isinstance(text_value, str):
+                    pieces.append(text_value)
+            if isinstance(item, dict):
+                text_attr = item.get("text")
+            else:
+                text_attr = getattr(item, "text", None)
+            if isinstance(text_attr, str):
+                pieces.append(text_attr)
+        return "".join(pieces)
+
     sidebar_state = _render_sidebar()
 
     if sidebar_state["reset_clicked"]:
@@ -676,13 +868,26 @@ def _render_chat_interface() -> None:
                 )
             )
 
-        image_parts = []
+        image_parts: List[Dict[str, Any]] = []
+        image_stats: List[Dict[str, Any]] = []
         if st.session_state.chat_images:
             if len(st.session_state.chat_images) > MAX_IMAGE_ATTACHMENTS:
                 st.session_state.chat_images = st.session_state.chat_images[:MAX_IMAGE_ATTACHMENTS]
             for f in list(st.session_state.chat_images):
                 try:
                     image_parts.append(to_image_part(f))
+                    size = getattr(f, "size", None)
+                    if size is None:
+                        try:
+                            size = len(f.getvalue())
+                        except Exception:
+                            size = 0
+                    image_stats.append(
+                        {
+                            "name": getattr(f, "name", "Image"),
+                            "size_bytes": size or 0,
+                        }
+                    )
                 except Exception as exc:  # noqa: BLE001 - display in UI
                     st.warning(f"Image ignorée ({f.name}) : {exc}")
 
@@ -807,9 +1012,34 @@ def _render_chat_interface() -> None:
             MAX_INPUT_TOKENS,
             RESERVE_OUTPUT_TOKENS,
         )
-        truncated_history_flag = (
-            count_tokens_chat(messages_for_api, selected_model) < original_prompt_tokens
+        prompt_tokens_after = count_tokens_chat(messages_for_api, selected_model)
+        truncated_history_flag = prompt_tokens_after < original_prompt_tokens
+
+        last_user_for_api = next(
+            (msg for msg in reversed(messages_for_api) if msg.get("role") == "user"),
+            None,
         )
+        is_multimodal_request = isinstance(
+            last_user_for_api.get("content") if last_user_for_api else None,
+            list,
+        )
+
+        call_context: Dict[str, Any] = {
+            "model": selected_model,
+            "call_type": "Responses API" if is_multimodal_request else "Chat Completions",
+            "messages_count": len(messages_for_api),
+            "prompt_tokens_before": original_prompt_tokens,
+            "prompt_tokens_after": prompt_tokens_after,
+            "truncated_context": truncated_context_flag,
+            "truncated_history": truncated_history_flag,
+            "image_count": len(image_stats),
+            "images": image_stats,
+            "attachments_count": len(attachments or []),
+            "rag_used": bool(hits),
+            "rag_hits": len(hits),
+            "sources_count": len(sources_info),
+            "usage": None,
+        }
 
         with st.chat_message("assistant"):
             if truncated_context_flag or truncated_history_flag:
@@ -821,29 +1051,56 @@ def _render_chat_interface() -> None:
 
             status_box.info("✍️ L’assistant est en train d’écrire…")
 
-            response_text = ""
-            usage_data = None
             first_token_displayed = False
+            acc: List[str] = []
+            usage_holder: Dict[str, Optional[Dict[str, int]]] = {"usage": None}
+            should_rerun = {"value": False}
 
-            try:
-                for chunk in _call_openai(client, messages_for_api):
-                    if chunk.choices and chunk.choices[0].delta:
-                        content = chunk.choices[0].delta.content or ""
-                        if content:
-                            if not first_token_displayed:
-                                status_box.empty()
-                                first_token_displayed = True
-                            response_text += content
-                            answer_box.markdown(response_text)
-                    if getattr(chunk, "usage", None):
-                        usage_data = _usage_to_dict(chunk.usage)
-            except Exception as error:  # noqa: BLE001 - display gracefully in UI
-                status_box.empty()
-                st.error(f"Erreur lors de l'appel à l'API : {error}")
-            else:
+            def _to_text(delta: Any) -> str:
+                if delta is None:
+                    return ""
+                if isinstance(delta, str):
+                    return delta
+                if isinstance(delta, dict):
+                    text_value = delta.get("text") or delta.get("value")
+                    if isinstance(text_value, str):
+                        return text_value
+                text_attr = getattr(delta, "text", None)
+                if isinstance(text_attr, str):
+                    return text_attr
+                value_attr = getattr(delta, "value", None)
+                if isinstance(value_attr, str):
+                    return value_attr
+                return str(delta)
+
+            def on_delta(delta_text: Any) -> None:
+                nonlocal first_token_displayed
+                text = _to_text(delta_text)
+                if not text:
+                    return
+                if not first_token_displayed:
+                    status_box.empty()
+                    first_token_displayed = True
+                acc.append(text)
+                answer_box.markdown("".join(acc))
+
+            def on_done(result: Any) -> None:
                 status_box.empty()
                 answer_box.empty()
-                _render_message_content(response_text)
+                usage_holder["usage"] = _usage_to_dict(getattr(result, "usage", None))
+                final_text = getattr(result, "output_text", None) or ""
+                if not final_text:
+                    final_text = "".join(acc)
+                if not final_text and hasattr(result, "output"):
+                    final_text = _extract_text_from_response_output(getattr(result, "output"))
+                if not final_text:
+                    final_text = ""
+
+                if final_text:
+                    _render_message_content(final_text)
+                else:
+                    st.info("Aucune réponse texte reçue.")
+
                 if hits:
                     sources_placeholder.markdown(
                         "Sources : "
@@ -858,18 +1115,53 @@ def _render_chat_interface() -> None:
                     sources_line = _format_sources_line(sources_info)
                     if sources_line:
                         sources_placeholder.caption(sources_line)
-                usage_text = _format_usage(usage_data)
+
+                usage_text = _format_usage(usage_holder["usage"])
                 if usage_text:
                     usage_placeholder.caption(usage_text)
+
                 st.session_state.messages.append(
                     {
                         "role": "assistant",
-                        "content": response_text,
-                        "usage": usage_data,
+                        "content": final_text,
+                        "usage": usage_holder["usage"],
                         "sources": sources_info if sources_info else None,
                     }
                 )
-        st.rerun()
+
+                call_context["usage"] = usage_holder["usage"]
+                call_context["response_chars"] = len(final_text)
+                call_context["sources_count"] = len(sources_info)
+                call_context["status"] = "success"
+                st.session_state.last_call_log = call_context
+                should_rerun["value"] = True
+
+            def on_error(err: Any) -> None:
+                status_box.empty()
+                answer_box.empty()
+                sources_placeholder.empty()
+                usage_placeholder.empty()
+                error_message = getattr(err, "message", None) or str(err)
+                st.error(f"Erreur API : {error_message}")
+                st.caption(
+                    "[Voir logs Streamlit Cloud](https://docs.streamlit.io/deploy/streamlit-community-cloud/get-started/manage-your-app#view-your-app-logs)"
+                )
+                call_context["error"] = error_message
+                call_context["status"] = "error"
+                call_context["response_chars"] = len("".join(acc))
+                st.session_state.last_call_log = call_context
+
+            call_llm(
+                client,
+                selected_model,
+                messages_for_api,
+                on_delta,
+                on_done,
+                on_error,
+            )
+
+        if should_rerun["value"]:
+            st.rerun()
 
 
 if __name__ == "__main__":
