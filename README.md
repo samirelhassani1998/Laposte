@@ -45,13 +45,22 @@ If you do not want to type your API key every time, you can create a `.env` file
 
 The chat interface now includes an optional retrieval-augmented generation (RAG) workflow:
 
-- **Drag & drop documents** directly in the sidebar (`csv`, `xlsx`, `xls`, `pdf`, `docx`, `txt`, `md`). Up to five files at a time and 20&nbsp;MB per file are accepted.
+- **Drag & drop documents** directly in the sidebar (`csv`, `xlsx`, `xls`, `pdf`, `docx`, `txt`, `md`). Up to five files can be indexed at a time and the per-file limit defaults to 20&nbsp;MB (configurable).
 - **On-demand indexing** builds an in-memory FAISS index for the current session using OpenAI's `text-embedding-3-large` model. Files are read in memory only; nothing is persisted on disk and the API key never leaves the session.
 - **Chunking & metadata**: each document is normalized, chunked (~4 000 chars with 400-char overlap), and enriched with metadata (source file, page/sheet/row range when applicable).
 - **Contextual answers**: when the index is populated, every new user question retrieves the top-4 chunks and injects them into the system prompt. Responses cite their sources and a badge indicates when RAG is active.
 - **Reset anytime**: use the “Réinitialiser base” button to clear the FAISS index and associated documents from the session state.
 
 The sidebar summarises the indexed corpus (file sizes, estimated tokens, chunk counts, embedding model). If a PDF contains no extractable text (e.g. scanned documents), the app warns you and skips it.
+
+## Limites et gros fichiers
+
+- La limite d'upload est gouvernée par `DEFAULT_MAX_FILE_MB` (20&nbsp;Mo par défaut). Surcharger `MAX_FILE_MB` via `st.secrets` ou une variable d'environnement permet d'augmenter ou diminuer ce plafond.
+- Quand `ALLOW_LARGE_FILES` vaut `true` (valeur par défaut), les documents au-delà de cette limite sont traités par morceaux plutôt qu'ignorés : CSV/TSV sont lus par blocs (`CSV_CHUNKSIZE_ROWS`), les classeurs Excel feuille par feuille (`EXCEL_MAX_SHEETS`), et les PDF page par page (`PDF_MAX_PAGES`). Les fichiers texte/DOCX suivent le flux habituel.
+- `MAX_TOTAL_CHARS` borne le volume total de caractères ingérés pour éviter des coûts d'embeddings ou une consommation mémoire disproportionnée. Adaptez ce paramètre selon vos contraintes.
+- Pour désactiver le traitement chunké et retrouver l'ancien comportement (fichiers volumineux ignorés), définissez `ALLOW_LARGE_FILES=false` dans l'environnement ou `st.secrets`.
+- Si vous relevez `MAX_FILE_MB` au-delà de 200, pensez à synchroniser la configuration Streamlit (`.streamlit/config.toml`, clé `server.maxUploadSize`) afin que l'upload navigateur/serveur suive.
+- Les fichiers massifs génèrent davantage de chunks et donc plus d'embeddings : surveillez vos coûts OpenAI, surtout avec `text-embedding-3-large`.
 
 ## License
 

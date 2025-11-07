@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import io
 import math
+import os
 import re
 from dataclasses import dataclass
+from io import BytesIO
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -38,19 +40,117 @@ else:  # pragma: no cover
 from pypdf import PdfReader
 
 
+# Limite d'upload (Mo) — configurable
+DEFAULT_MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", st.secrets.get("MAX_FILE_MB", 20)))
+# Autoriser le traitement chunké > limite (au lieu d'ignorer)
+ALLOW_LARGE_FILES = (
+    os.getenv("ALLOW_LARGE_FILES", str(st.secrets.get("ALLOW_LARGE_FILES", "true"))).lower()
+    == "true"
+)
+
+# Bornes de sécurité RAG (éviter coûts/ram démesurés)
+MAX_TOTAL_CHARS = int(
+    os.getenv("MAX_TOTAL_CHARS", st.secrets.get("MAX_TOTAL_CHARS", 2_000_000))
+)
+CSV_CHUNKSIZE_ROWS = int(
+    os.getenv("CSV_CHUNKSIZE_ROWS", st.secrets.get("CSV_CHUNKSIZE_ROWS", 100_000))
+)
+EXCEL_MAX_SHEETS = int(
+    os.getenv("EXCEL_MAX_SHEETS", st.secrets.get("EXCEL_MAX_SHEETS", 8))
+)
+PDF_MAX_PAGES = int(os.getenv("PDF_MAX_PAGES", st.secrets.get("PDF_MAX_PAGES", 1_000)))
+
+
 TEXT_EXTENSIONS = {"txt", "md"}
-CSV_EXTENSIONS = {"csv"}
+CSV_EXTENSIONS = {"csv", "tsv"}
 EXCEL_EXTENSIONS = {"xlsx", "xls"}
 PDF_EXTENSIONS = {"pdf"}
 DOCX_EXTENSIONS = {"docx"}
 SUPPORTED_EXTENSIONS = TEXT_EXTENSIONS | CSV_EXTENSIONS | EXCEL_EXTENSIONS | PDF_EXTENSIONS | DOCX_EXTENSIONS
 
+
+def format_bytes(n: int) -> str:
+    for unit in ["B", "KB", "MB", "GB"]:
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def read_csv_streamed(file_bytes: bytes, max_rows: int | None = None, sep: str = ",") -> str:
+    """Lit un CSV en chunks pour limiter la RAM et retourne un gros texte tabulaire."""
+    bio = BytesIO(file_bytes)
+    rows = 0
+    texts: List[str] = []
+    char_total = 0
+    encoding = _detect_encoding(file_bytes)
+    try:
+        reader = pd.read_csv(bio, chunksize=CSV_CHUNKSIZE_ROWS, sep=sep, encoding=encoding)
+    except UnicodeDecodeError:
+        bio = BytesIO(file_bytes)
+        reader = pd.read_csv(
+            bio,
+            chunksize=CSV_CHUNKSIZE_ROWS,
+            sep=sep,
+            encoding="utf-8",
+            encoding_errors="ignore",
+        )
+    for chunk in reader:
+        chunk_csv = chunk.to_csv(index=False)
+        texts.append(chunk_csv)
+        char_total += len(chunk_csv)
+        rows += len(chunk)
+        if max_rows and rows >= max_rows:
+            break
+        if char_total >= MAX_TOTAL_CHARS:
+            break
+    return "\n".join(texts)
+
+
+def read_excel_streamed(file_bytes: bytes) -> str:
+    bio = BytesIO(file_bytes)
+    sheets = pd.read_excel(bio, sheet_name=None)
+    texts: List[str] = []
+    char_total = 0
+    for i, (name, df) in enumerate(sheets.items()):
+        if i >= EXCEL_MAX_SHEETS:
+            break
+        text = df.to_csv(index=False)
+        texts.append(f"### Sheet: {name}\n{text}")
+        char_total += len(texts[-1])
+        if char_total >= MAX_TOTAL_CHARS:
+            break
+    return "\n\n".join(texts)
+
+
+def read_pdf_paged(file_bytes: bytes) -> List[Tuple[str, Dict[str, Any]]]:
+    """Retourne [(texte_page, meta), ...] pour chaque page (tronqué si besoin)."""
+    bio = BytesIO(file_bytes)
+    reader = PdfReader(bio)
+    pages: List[Tuple[str, Dict[str, Any]]] = []
+    total = 0
+    for i, page in enumerate(reader.pages):
+        if i >= PDF_MAX_PAGES:
+            break
+        txt = page.extract_text() or ""
+        if not txt.strip():
+            continue  # page vide / scannée
+        pages.append((txt, {"page": i + 1}))
+        total += len(txt)
+        if total >= MAX_TOTAL_CHARS:
+            break
+    return pages
+
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-large"
 CHAT_MAX_FILES = 5
-CHAT_MAX_FILE_SIZE = 20 * 1024 * 1024
+CHAT_MAX_FILE_SIZE = DEFAULT_MAX_FILE_MB * 1024 * 1024
 
 _STATUS_UPDATE_CALLBACK: Optional[Callable[[str, str], None]] = None
 _STATUS_WRITE_CALLBACK: Optional[Callable[[str], None]] = None
+
+
+def should_stream_file(size_bytes: int) -> bool:
+    return size_bytes > DEFAULT_MAX_FILE_MB * 1024 * 1024 and ALLOW_LARGE_FILES
 
 
 def configure_status_callbacks(
@@ -144,6 +244,8 @@ def _ingest_text_document(
     overlap: int,
 ) -> Tuple[List[DocumentChunk], Dict[str, Any], List[str]]:
     text_content = _bytes_to_text(data)
+    if len(text_content) > MAX_TOTAL_CHARS:
+        text_content = text_content[:MAX_TOTAL_CHARS]
     chunks = [
         DocumentChunk(text=chunk, meta={"source": name, "type": file_type})
         for chunk in chunk_text(text_content, max_chars=max_chars, overlap=overlap)
@@ -164,72 +266,49 @@ def _ingest_csv(
     *,
     max_chars: int,
     overlap: int,
+    stream: bool = False,
 ) -> Tuple[List[DocumentChunk], Dict[str, Any], List[str]]:
-    encoding = _detect_encoding(data)
     warnings: List[str] = []
-    try:
-        df = pd.read_csv(io.BytesIO(data), encoding=encoding)
-    except UnicodeDecodeError:
-        df = pd.read_csv(io.BytesIO(data), encoding="utf-8", errors="ignore")
-    except Exception as exc:
-        return [], {}, [f"Erreur lors de la lecture CSV {name}: {exc}"]
-
-    if df.empty:
-        warnings.append(f"Le fichier CSV {name} est vide.")
-        summary = {
-            "name": name,
-            "type": "csv",
-            "size_bytes": len(data),
-            "chunk_count": 0,
-            "token_estimate": 0,
-        }
-        return [], summary, warnings
-
-    csv_text = df.to_csv(index=False)
-    lines = csv_text.splitlines()
-
-    chunks: List[DocumentChunk] = []
-    line_start = 1
-    buffer: List[str] = []
-    char_count = 0
-    max_chars_local = max_chars
-    overlap_local = overlap
-
-    for i, line in enumerate(lines, start=1):
-        line_with_newline = line + "\n"
-        if char_count + len(line_with_newline) > max_chars_local and buffer:
-            chunk_text_value = "".join(buffer)
-            for part in chunk_text(chunk_text_value, max_chars=max_chars_local, overlap=overlap_local):
-                chunks.append(
-                    DocumentChunk(
-                        text=part,
-                        meta={
-                            "source": name,
-                            "type": "csv",
-                            "row_range": f"{line_start}-{i-1}",
-                        },
-                    )
-                )
-            buffer = []
-            char_count = 0
-            line_start = i
-
-        buffer.append(line_with_newline)
-        char_count += len(line_with_newline)
-
-    if buffer:
-        chunk_text_value = "".join(buffer)
-        for part in chunk_text(chunk_text_value, max_chars=max_chars_local, overlap=overlap_local):
-            chunks.append(
-                DocumentChunk(
-                    text=part,
-                    meta={
-                        "source": name,
-                        "type": "csv",
-                        "row_range": f"{line_start}-{len(lines)}",
-                    },
-                )
+    lower_name = name.lower()
+    sep = "\t" if lower_name.endswith(".tsv") else ","
+    if stream:
+        csv_text = read_csv_streamed(data, sep=sep)
+    else:
+        encoding = _detect_encoding(data)
+        try:
+            df = pd.read_csv(io.BytesIO(data), encoding=encoding, sep=sep)
+        except UnicodeDecodeError:
+            df = pd.read_csv(
+                io.BytesIO(data),
+                encoding="utf-8",
+                encoding_errors="ignore",
+                sep=sep,
             )
+        except Exception as exc:
+            return [], {}, [f"Erreur lors de la lecture CSV {name}: {exc}"]
+
+        if df.empty:
+            warnings.append(f"Le fichier CSV {name} est vide.")
+            summary = {
+                "name": name,
+                "type": "csv",
+                "size_bytes": len(data),
+                "chunk_count": 0,
+                "token_estimate": 0,
+            }
+            return [], summary, warnings
+
+        csv_text = df.to_csv(index=False)
+        if len(csv_text) > MAX_TOTAL_CHARS:
+            csv_text = csv_text[:MAX_TOTAL_CHARS]
+
+    chunks = [
+        DocumentChunk(
+            text=chunk,
+            meta={"source": name, "type": "csv"},
+        )
+        for chunk in chunk_text(csv_text, max_chars=max_chars, overlap=overlap)
+    ]
 
     summary = {
         "name": name,
@@ -247,26 +326,36 @@ def _ingest_excel(
     *,
     max_chars: int,
     overlap: int,
+    stream: bool = False,
 ) -> Tuple[List[DocumentChunk], Dict[str, Any], List[str]]:
     warnings: List[str] = []
-    try:
-        sheets = pd.read_excel(io.BytesIO(data), sheet_name=None)
-    except Exception as exc:
-        return [], {}, [f"Erreur lors de la lecture Excel {name}: {exc}"]
+    if stream:
+        excel_text = read_excel_streamed(data)
+        chunks = [
+            DocumentChunk(text=chunk, meta={"source": name, "type": "excel"})
+            for chunk in chunk_text(excel_text, max_chars=max_chars, overlap=overlap)
+        ]
+    else:
+        try:
+            sheets = pd.read_excel(io.BytesIO(data), sheet_name=None)
+        except Exception as exc:
+            return [], {}, [f"Erreur lors de la lecture Excel {name}: {exc}"]
 
-    chunks: List[DocumentChunk] = []
-    for sheet_name, df in sheets.items():
-        if df.empty:
-            warnings.append(f"La feuille '{sheet_name}' dans {name} est vide.")
-            continue
-        text = df.to_csv(index=False)
-        for part in chunk_text(text, max_chars=max_chars, overlap=overlap):
-            chunks.append(
-                DocumentChunk(
-                    text=part,
-                    meta={"source": name, "type": "excel", "sheet": sheet_name},
+        chunks = []
+        for sheet_name, df in sheets.items():
+            if df.empty:
+                warnings.append(f"La feuille '{sheet_name}' dans {name} est vide.")
+                continue
+            text = df.to_csv(index=False)
+            if len(text) > MAX_TOTAL_CHARS:
+                text = text[:MAX_TOTAL_CHARS]
+            for part in chunk_text(text, max_chars=max_chars, overlap=overlap):
+                chunks.append(
+                    DocumentChunk(
+                        text=part,
+                        meta={"source": name, "type": "excel", "sheet": sheet_name},
+                    )
                 )
-            )
 
     summary = {
         "name": name,
@@ -284,25 +373,46 @@ def _ingest_pdf(
     *,
     max_chars: int,
     overlap: int,
+    stream: bool = False,
 ) -> Tuple[List[DocumentChunk], Dict[str, Any], List[str]]:
-    pdf_reader = PdfReader(io.BytesIO(data))
     chunks: List[DocumentChunk] = []
     warnings: List[str] = []
 
-    for page_number, page in enumerate(pdf_reader.pages, start=1):
-        try:
-            text = page.extract_text() or ""
-        except Exception as exc:
-            warnings.append(f"Extraction impossible page {page_number} ({name}) : {exc}")
-            continue
-        cleaned = _clean_text(text)
-        if not cleaned:
-            warnings.append(f"Page {page_number} du PDF {name} semble ne contenir aucun texte.")
-            continue
-        for chunk in chunk_text(cleaned, max_chars=max_chars, overlap=overlap):
-            chunks.append(
-                DocumentChunk(text=chunk, meta={"source": name, "type": "pdf", "page": page_number})
-            )
+    if stream:
+        for page_text, meta in read_pdf_paged(data):
+            cleaned = _clean_text(page_text)
+            if not cleaned:
+                continue
+            for chunk in chunk_text(cleaned, max_chars=max_chars, overlap=overlap):
+                chunk_meta = {"source": name, "type": "pdf", **meta}
+                chunks.append(DocumentChunk(text=chunk, meta=chunk_meta))
+    else:
+        pdf_reader = PdfReader(io.BytesIO(data))
+        total_chars = 0
+        for page_number, page in enumerate(pdf_reader.pages, start=1):
+            if total_chars >= MAX_TOTAL_CHARS:
+                break
+            try:
+                text = page.extract_text() or ""
+            except Exception as exc:
+                warnings.append(f"Extraction impossible page {page_number} ({name}) : {exc}")
+                continue
+            cleaned = _clean_text(text)
+            if not cleaned:
+                warnings.append(f"Page {page_number} du PDF {name} semble ne contenir aucun texte.")
+                continue
+            remaining = MAX_TOTAL_CHARS - total_chars
+            truncated = cleaned[:remaining]
+            total_chars += len(truncated)
+            for chunk in chunk_text(truncated, max_chars=max_chars, overlap=overlap):
+                chunks.append(
+                    DocumentChunk(
+                        text=chunk,
+                        meta={"source": name, "type": "pdf", "page": page_number},
+                    )
+                )
+            if total_chars >= MAX_TOTAL_CHARS:
+                break
 
     summary = {
         "name": name,
@@ -331,6 +441,8 @@ def _ingest_docx(
 
     paragraphs = [p.text for p in document.paragraphs if p.text.strip()]
     full_text = "\n".join(paragraphs)
+    if len(full_text) > MAX_TOTAL_CHARS:
+        full_text = full_text[:MAX_TOTAL_CHARS]
     chunks = [
         DocumentChunk(text=chunk, meta={"source": name, "type": "docx"})
         for chunk in chunk_text(full_text, max_chars=max_chars, overlap=overlap)
@@ -351,16 +463,25 @@ def load_file_to_chunks(uploaded_file, max_chars: int = 4000, overlap: int = 400
     if extension not in SUPPORTED_EXTENSIONS:
         return [], {}, [f"Format non supporté : {name}"]
 
+    size = getattr(uploaded_file, "size", None)
     data = uploaded_file.getvalue()
+    if size is None:
+        size = len(data)
+
+    if size > CHAT_MAX_FILE_SIZE and not ALLOW_LARGE_FILES:
+        limit_mb = DEFAULT_MAX_FILE_MB
+        return [], {}, [f"{name} ({format_bytes(size)}) dépasse {limit_mb} Mo et a été ignoré."]
+
+    stream_mode = should_stream_file(size)
 
     if extension in TEXT_EXTENSIONS:
         return _ingest_text_document(name, data, extension, max_chars=max_chars, overlap=overlap)
     if extension in CSV_EXTENSIONS:
-        return _ingest_csv(name, data, max_chars=max_chars, overlap=overlap)
+        return _ingest_csv(name, data, max_chars=max_chars, overlap=overlap, stream=stream_mode)
     if extension in EXCEL_EXTENSIONS:
-        return _ingest_excel(name, data, max_chars=max_chars, overlap=overlap)
+        return _ingest_excel(name, data, max_chars=max_chars, overlap=overlap, stream=stream_mode)
     if extension in PDF_EXTENSIONS:
-        return _ingest_pdf(name, data, max_chars=max_chars, overlap=overlap)
+        return _ingest_pdf(name, data, max_chars=max_chars, overlap=overlap, stream=stream_mode)
     if extension in DOCX_EXTENSIONS:
         return _ingest_docx(name, data, max_chars=max_chars, overlap=overlap)
 
@@ -439,17 +560,13 @@ def index_files_from_chat(files: Sequence[Any]) -> Dict[str, Any]:
         _STATUS_UPDATE_CALLBACK("📥 Lecture des fichiers…", "running")
 
     for name, data, size in normalised:
-        if size > CHAT_MAX_FILE_SIZE:
-            warnings.append(f"{name} dépasse 20 Mo et a été ignoré.")
-            if _STATUS_WRITE_CALLBACK:
-                _STATUS_WRITE_CALLBACK(f"⚠️ {name} — dépasse 20 Mo, ignoré.")
-            continue
-
         in_memory = _InMemoryUploadedFile(name, data)
         try:
             chunks, summary, chunk_warnings = load_file_to_chunks(in_memory)
         except Exception as exc:  # noqa: BLE001 - feedback in UI
-            warnings.append(f"{name} : {exc}")
+            warn_msg = f"Impossible d'indexer {name} ({format_bytes(size)}): {exc}"
+            st.warning(warn_msg)
+            warnings.append(warn_msg)
             if _STATUS_WRITE_CALLBACK:
                 _STATUS_WRITE_CALLBACK(f"❌ {name} : {exc}")
             continue
@@ -462,9 +579,11 @@ def index_files_from_chat(files: Sequence[Any]) -> Dict[str, Any]:
                 for warn in chunk_warnings:
                     _STATUS_WRITE_CALLBACK(f"⚠️ {warn}")
         if not chunks:
-            warnings.append(f"⚠️ {name} — aucun texte exploitable.")
-            if _STATUS_WRITE_CALLBACK:
-                _STATUS_WRITE_CALLBACK(f"⚠️ {name} — aucun texte exploitable.")
+            if not chunk_warnings:
+                msg = f"⚠️ {name} — aucun texte exploitable."
+                warnings.append(msg)
+                if _STATUS_WRITE_CALLBACK:
+                    _STATUS_WRITE_CALLBACK(msg)
             continue
 
         for chunk in chunks:
