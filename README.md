@@ -1,58 +1,46 @@
-# Chatbot Streamlit + OpenAI
+# ChatGPT-like Streamlit Chatbot
 
-Application web construite avec [Streamlit](https://streamlit.io/) permettant de discuter avec les modèles OpenAI les plus récents. L'interface offre un historique de conversation complet, un rôle système éditable et des paramètres ajustables pour le modèle et la température.
+This project recreates a minimal ChatGPT-style user interface using Streamlit and the OpenAI API. Users can supply their own API key directly in the app, pick a model, and begin chatting immediately.
 
-## ✨ Fonctionnalités
-- Interface conversationnelle moderne avec `st.chat_message` et `st.chat_input`.
-- Rôle système personnalisable et sauvegarde de l'historique dans la session Streamlit.
-- Choix du modèle OpenAI et réglage de la température.
-- Bouton de réinitialisation pour repartir d'une conversation vierge.
-- Gestion sécurisée de la clé API via `st.secrets` ou la variable d'environnement `OPENAI_API_KEY`.
+## Features
 
-## 🚀 Démarrage rapide
+- **Inline API key capture**: Provide your OpenAI API key inside the app—no need for `st.secrets`.
+- **Model selection**: Switch between available models such as GPT-4o, GPT-4o mini, and GPT-5 (if enabled on your account).
+- **Clean conversation view**: Messages are displayed in a vertically stacked chat log with a chat input area at the bottom of the screen.
+- **Session persistence**: The API key and conversation history live in `st.session_state` during the browsing session.
 
-### Prérequis
-- Python 3.11 (recommandé)
-- Une clé API OpenAI valide.
+## Getting Started
 
-### Installation locale
+### Prerequisites
+
+- Python 3.9+
+- An OpenAI API key with access to the desired models
+
+### Installation
+
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # ou .venv\\Scripts\\activate sur Windows
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Créez ensuite un fichier `.streamlit/secrets.toml` en vous inspirant de `.streamlit/secrets.example.toml` :
-```toml
-OPENAI_API_KEY = "votre_cle_api"
-```
+### Running the App
 
-Lancez l'application :
 ```bash
 streamlit run main.py
 ```
 
-## ☁️ Déploiement sur Streamlit Cloud
-1. Poussez ce dépôt vers GitHub.
-2. Dans Streamlit Cloud, créez une nouvelle app pointant vers `main.py`.
-3. Ajoutez la clé API dans la section **Secrets** du projet (`OPENAI_API_KEY`).
-4. Déployez : l'application est prête !
+Open the provided local URL in your browser. The app will first ask for your API key. Once provided, it reveals the chat interface.
 
-## 📁 Structure du projet
-```
-.
-├── main.py
-├── pages/
-│   └── 01_About.md
-├── requirements.txt
-├── README.md
-├── LICENSE
-├── .gitignore
-├── .streamlit/
-│   ├── config.toml
-│   └── secrets.example.toml
-└── runtime.txt
-```
+### Environment Variables (Optional)
 
-## 🛡️ Licence
-Ce projet est distribué sous licence [MIT](LICENSE).
+If you do not want to type your API key every time, you can create a `.env` file at the project root and set `OPENAI_API_KEY=...`. The app will load it automatically on startup, but the key can still be changed from the UI at any time.
+
+## Customization
+
+- Update the list of models in `main.py` to match the ones available on your account.
+- Adjust the theme colors in `.streamlit/config.toml` to tweak the look and feel.
+
+## License
+
+This project is released under the [MIT License](LICENSE).

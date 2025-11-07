@@ -1,158 +1,212 @@
-"""Streamlit chatbot application powered by OpenAI models."""
-
-from __future__ import annotations
-
 import os
-from typing import Dict, List
+from typing import List, Dict
 
 import streamlit as st
+from dotenv import load_dotenv
 from openai import OpenAI
 
 
-DEFAULT_SYSTEM_PROMPT = "Vous êtes un assistant utile et concis."
-DEFAULT_MODEL = "gpt-4o-mini"
+load_dotenv()
+
+st.set_page_config(page_title="ChatGPT-like Chatbot", layout="wide")
+
 AVAILABLE_MODELS = [
-    "gpt-4o-mini",
     "gpt-4o",
-    "gpt-4.1-mini",
+    "gpt-4o-mini",
     "gpt-4.1",
-    "o4-mini",
+    "gpt-5",
 ]
 
 
-def get_api_key() -> str | None:
-    """Return the OpenAI API key from Streamlit secrets or environment variables."""
-    api_key = st.secrets.get("OPENAI_API_KEY") if hasattr(st, "secrets") else None
-    if not api_key:
-        api_key = os.getenv("OPENAI_API_KEY")
-    return api_key
-
-
-def init_session_state() -> None:
-    """Initialize default values in Streamlit session state."""
+def _init_session_state() -> None:
+    if "api_key" not in st.session_state:
+        env_key = os.getenv("OPENAI_API_KEY")
+        st.session_state.api_key = env_key if env_key else None
     if "messages" not in st.session_state:
-        st.session_state.messages: List[Dict[str, str]] = []
-    if "system_prompt" not in st.session_state:
-        st.session_state.system_prompt = DEFAULT_SYSTEM_PROMPT
-    if "model" not in st.session_state:
-        st.session_state.model = DEFAULT_MODEL
-    if "temperature" not in st.session_state:
-        st.session_state.temperature = 0.7
+        st.session_state.messages = []
+    if "selected_model" not in st.session_state:
+        st.session_state.selected_model = AVAILABLE_MODELS[0]
 
 
-def reset_conversation() -> None:
-    """Reset the chat history while preserving the system prompt and parameters."""
+def _reset_chat() -> None:
     st.session_state.messages = []
 
 
-def render_sidebar() -> None:
-    """Render sidebar controls for the chatbot configuration."""
-    with st.sidebar:
-        st.title("Paramètres")
+def _remove_api_key() -> None:
+    st.session_state.api_key = None
+    _reset_chat()
+    st.rerun()
 
-        st.session_state.system_prompt = st.text_area(
-            "Rôle système",
-            value=st.session_state.system_prompt,
-            help="Définissez le contexte ou les instructions données au modèle.",
-            height=120,
-        )
 
-        model_index = 0
-        if st.session_state.model in AVAILABLE_MODELS:
-            model_index = AVAILABLE_MODELS.index(st.session_state.model)
+def _render_key_gate() -> None:
+    st.markdown(
+        """
+        <style>
+            .login-wrapper {
+                max-width: 420px;
+                margin: 10vh auto;
+                padding: 2.5rem;
+                background: #ffffff;
+                border-radius: 18px;
+                border: 1px solid #e5e7eb;
+                box-shadow: 0 20px 45px rgba(15, 23, 42, 0.08);
+            }
+            .login-wrapper h1 {
+                text-align: center;
+                margin-bottom: 0.5rem;
+            }
+            .login-wrapper p {
+                text-align: center;
+                color: #6b7280;
+                margin-bottom: 1.5rem;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        st.session_state.model = st.selectbox(
-            "Modèle OpenAI",
-            options=AVAILABLE_MODELS,
-            index=model_index,
-            help="Choisissez le modèle à utiliser pour la conversation.",
-        )
-
-        st.session_state.temperature = st.slider(
-            "Température",
-            min_value=0.0,
-            max_value=1.0,
-            value=float(st.session_state.temperature),
-            step=0.05,
-            help="Plus la température est élevée, plus les réponses seront créatives.",
-        )
-
-        st.button(
-            "Réinitialiser la conversation",
-            type="primary",
-            use_container_width=True,
-            on_click=reset_conversation,
-        )
-
+    with st.form("api-key-form", clear_on_submit=False):
         st.markdown(
             """
-            **Astuce :** Définissez votre clé API dans *Streamlit Cloud* via les secrets,
-            ou configurez la variable d'environnement `OPENAI_API_KEY` en local.
-            """
+            <div class='login-wrapper'>
+                <h1>Bienvenue</h1>
+                <p>Entrez votre clé API OpenAI pour démarrer la conversation.</p>
+            """,
+            unsafe_allow_html=True,
         )
+        api_key_input = st.text_input(
+            "Clé API OpenAI",
+            type="password",
+            placeholder="sk-...",
+            label_visibility="collapsed",
+        )
+        submit = st.form_submit_button("Continuer", use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if submit:
+        if not api_key_input:
+            st.error("Merci de renseigner une clé API valide.")
+        else:
+            st.session_state.api_key = api_key_input.strip()
+            _reset_chat()
+            st.rerun()
 
 
-def build_prompt_history(conversation: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Construct the message payload to send to OpenAI."""
-    messages: List[Dict[str, str]] = []
-    system_prompt = st.session_state.system_prompt.strip()
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.extend(conversation)
-    return messages
+
+def _render_sidebar() -> None:
+    with st.sidebar:
+        st.markdown("### Paramètres")
+        try:
+            default_index = AVAILABLE_MODELS.index(st.session_state.selected_model)
+        except ValueError:
+            default_index = 0
+        model = st.selectbox("Modèle", AVAILABLE_MODELS, index=default_index)
+        st.session_state.selected_model = model
+
+        st.button("Nouvelle conversation", on_click=_reset_chat)
+        st.button("Changer de clé API", on_click=_remove_api_key)
+
+        st.markdown("---")
+        st.caption("Votre clé n'est jamais sauvegardée côté serveur.")
 
 
-def generate_response(client: OpenAI, conversation: List[Dict[str, str]]) -> str:
-    """Call the OpenAI API and return the assistant response."""
+def _call_openai(messages: List[Dict[str, str]]) -> str:
+    client = OpenAI(api_key=st.session_state.api_key)
     response = client.chat.completions.create(
-        model=st.session_state.model,
-        temperature=st.session_state.temperature,
-        messages=build_prompt_history(conversation),
+        model=st.session_state.selected_model,
+        messages=messages,
     )
-    return response.choices[0].message.content.strip()
+    return response.choices[0].message.content or ""
 
 
-def main() -> None:
-    st.set_page_config(page_title="Chatbot OpenAI", page_icon="💬", layout="wide")
-    st.title("🤖 Chatbot OpenAI")
-    st.write("Discutez avec un modèle OpenAI directement depuis cette application Streamlit.")
+def _render_chat_interface() -> None:
+    _render_sidebar()
 
-    init_session_state()
-    render_sidebar()
+    st.markdown(
+        """
+        <style>
+        #MainMenu {visibility: hidden;}
+        header {visibility: hidden;}
+        footer {visibility: hidden;}
+        .block-container {padding-top: 2rem !important; padding-bottom: 6rem !important;}
+        .stChatFloatingInputContainer {bottom: 1.5rem;}
+        div[data-testid="stChatMessage"] {background: transparent;}
+        div[data-testid="stChatMessageUser"] > div:nth-child(1) {
+            background: #e7f5f0;
+            color: #0f172a;
+            border-radius: 12px;
+            padding: 0.75rem 1rem;
+        }
+        div[data-testid="stChatMessageAssistant"] > div:nth-child(1) {
+            background: #ffffff;
+            color: #111827;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 0.75rem 1rem;
+        }
+        .chat-header {
+            font-size: 1.75rem;
+            font-weight: 600;
+            margin-bottom: 1.5rem;
+        }
+        .empty-state {
+            margin-top: 15vh;
+            text-align: center;
+            color: #6b7280;
+        }
+        .empty-state h2 {
+            color: #111827;
+            font-size: 2.25rem;
+            margin-bottom: 0.5rem;
+        }
+        .empty-state p {
+            margin: 0.25rem 0;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    api_key = get_api_key()
-    if not api_key:
-        st.warning(
-            "⚠️ Aucune clé API OpenAI détectée. Ajoutez `OPENAI_API_KEY` dans vos secrets ou variables d'environnement pour utiliser l'application."
-        )
-        st.stop()
-
-    client = OpenAI(api_key=api_key)
+    st.markdown("<div class='chat-header'>ChatGPT-like Chatbot</div>", unsafe_allow_html=True)
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    user_input = st.chat_input("Entrez votre message…")
-    if user_input:
+    if not st.session_state.messages:
+        st.markdown(
+            """
+            <div class='empty-state'>
+                <h2>Que voulez-vous savoir aujourd'hui ?</h2>
+                <p>Choisissez un modèle dans la barre latérale et lancez la discussion.</p>
+                <p>Votre historique reste visible dans cette fenêtre, comme sur ChatGPT.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    prompt = st.chat_input("Envoyer un message")
+    if prompt and prompt.strip():
+        user_message = prompt.strip()
+        st.session_state.messages.append({"role": "user", "content": user_message})
         with st.chat_message("user"):
-            st.markdown(user_input)
-
-        conversation = st.session_state.messages + [{"role": "user", "content": user_input}]
-
-        try:
-            assistant_reply = generate_response(client, conversation)
-        except Exception as exc:
-            with st.chat_message("assistant"):
-                st.error(f"Une erreur est survenue lors de l'appel à l'API : {exc}")
-            return
-
-        conversation.append({"role": "assistant", "content": assistant_reply})
-        st.session_state.messages = conversation
+            st.markdown(user_message)
 
         with st.chat_message("assistant"):
-            st.markdown(assistant_reply)
+            placeholder = st.empty()
+            try:
+                reply = _call_openai(st.session_state.messages)
+            except Exception as error:  # noqa: BLE001 - handled gracefully for the UI
+                placeholder.error(f"Erreur lors de l'appel à l'API : {error}")
+            else:
+                placeholder.markdown(reply)
+                st.session_state.messages.append({"role": "assistant", "content": reply})
 
 
 if __name__ == "__main__":
-    main()
+    _init_session_state()
+
+    if not st.session_state.api_key:
+        _render_key_gate()
+    else:
+        _render_chat_interface()
