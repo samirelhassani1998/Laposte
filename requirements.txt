@@ -1,3 +1,11 @@
-streamlit>=1.37.0
-openai>=1.31.0
+streamlit>=1.33.0
+openai>=1.40.0
 python-dotenv>=1.0.1
+faiss-cpu>=1.7.4
+pypdf>=4.0.0
+python-docx>=1.0.0
+pandas>=2.2.0
+openpyxl>=3.1.2
+tiktoken>=0.7.0
+chardet>=5.2.0
+numpy>=1.26.0
