@@ -1,6 +1,7 @@
 # ChatGPT-like Streamlit Chatbot
 
 This project recreates a minimal ChatGPT-style user interface using Streamlit and the OpenAI API. Users can supply their own API key directly in the app, pick a model, and begin chatting immediately.
+URL: https://laposte-57sgwe24hqzegfthseuprg.streamlit.app/
 
 ## Features
 
