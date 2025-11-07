@@ -260,28 +260,34 @@ def _render_chat_interface() -> None:
         ]
 
         with st.chat_message("assistant"):
-            spinner_placeholder = st.empty()
-            stream_placeholder = st.empty()
+            status_box = st.empty()
+            answer_box = st.empty()
             usage_placeholder = st.empty()
+
+            status_box.info("✍️ L’assistant est en train d’écrire…")
+
             response_text = ""
             usage_data = None
+            first_token_displayed = False
 
             try:
-                with spinner_placeholder.spinner("Assistant est en train d'écrire…"):
-                    for chunk in _call_openai(messages_for_api):
-                        if chunk.choices and chunk.choices[0].delta:
-                            content = chunk.choices[0].delta.content or ""
-                            if content:
-                                response_text += content
-                                stream_placeholder.markdown(response_text)
-                        if getattr(chunk, "usage", None):
-                            usage_data = _usage_to_dict(chunk.usage)
+                for chunk in _call_openai(messages_for_api):
+                    if chunk.choices and chunk.choices[0].delta:
+                        content = chunk.choices[0].delta.content or ""
+                        if content:
+                            if not first_token_displayed:
+                                status_box.empty()
+                                first_token_displayed = True
+                            response_text += content
+                            answer_box.markdown(response_text)
+                    if getattr(chunk, "usage", None):
+                        usage_data = _usage_to_dict(chunk.usage)
             except Exception as error:  # noqa: BLE001 - display gracefully in UI
-                spinner_placeholder.empty()
-                stream_placeholder.error(f"Erreur lors de l'appel à l'API : {error}")
+                status_box.empty()
+                st.error(f"Erreur lors de l'appel à l'API : {error}")
             else:
-                spinner_placeholder.empty()
-                stream_placeholder.empty()
+                status_box.empty()
+                answer_box.empty()
                 _render_message_content(response_text)
                 usage_text = _format_usage(usage_data)
                 if usage_text:
