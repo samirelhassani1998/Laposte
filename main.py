@@ -45,6 +45,9 @@ AVAILABLE_MODELS = [
 ]
 
 
+PREFERRED_MODELS = ["gpt-5", "gpt-4o", "gpt-4o-mini"]
+
+
 EMBEDDING_MODEL = "text-embedding-3-large"
 VISION_MODELS = {"gpt-4o", "gpt-4o-mini", "gpt-5"}
 MAX_INPUT_TOKENS = 300_000
@@ -68,6 +71,19 @@ def _contains_image_parts(message: Optional[Dict[str, Any]]) -> bool:
         if isinstance(part, dict) and part.get("type") in {"input_image", "image_url"}:
             return True
     return False
+
+
+def is_org_verify_stream_error(e: Exception) -> bool:
+    try:
+        err = getattr(e, "response", None) or getattr(e, "error", None) or {}
+        msg = str(getattr(err, "message", "")) or str(e)
+        code = getattr(err, "code", "") or ""
+        param = getattr(err, "param", "") or ""
+        return ("must be verified to stream this model" in msg.lower()) or (
+            code == "unsupported_value" and param == "stream"
+        )
+    except Exception:
+        return False
 
 
 def _init_session_state() -> None:
@@ -474,77 +490,178 @@ def _format_usage(usage: Optional[Dict[str, int]]) -> Optional[str]:
     return "Usage tokens — " + ", ".join(parts)
 
 
-def stream_via_responses(
+def responses_stream(
     client: OpenAI,
     model: str,
-    payload_messages: Sequence[Dict[str, Any]],
+    payload: Sequence[Dict[str, Any]],
     on_delta,
-    on_done,
-    on_error,
-) -> None:
-    try:
-        payload = to_responses_input(list(payload_messages))
-        with client.responses.stream(
-            model=model,
-            input=payload,
-        ) as stream:
-            for event in stream:
-                try:
-                    if event.type == "response.output_text.delta":
-                        on_delta(getattr(event, "delta", ""))
-                    elif event.type == "response.error":
-                        on_error(getattr(event, "error", "Erreur inconnue"))
-                        return
-                except Exception as inner_exc:  # noqa: BLE001 - propagate to UI
-                    on_error(inner_exc)
-                    return
-            try:
-                result = stream.get_final_response()
-            except Exception as final_exc:  # noqa: BLE001 - propagate to UI
-                on_error(final_exc)
-                return
-            on_done(result)
-    except Exception as exc:  # noqa: BLE001 - surface to UI
-        on_error(exc)
-
-
-def stream_via_chat_completions(
-    client: OpenAI,
-    model: str,
-    payload_messages: Sequence[Dict[str, Any]],
-    on_delta,
-    on_done,
-    on_error,
-) -> None:
-    try:
-        payload = to_chat_messages(list(payload_messages))
-        stream = client.chat.completions.create(
-            model=model,
-            messages=payload,
-            stream=True,
-            stream_options={"include_usage": True},
-        )
-        final_parts: List[str] = []
-        usage_data = None
-        for chunk in stream:
-            try:
-                choice = chunk.choices[0] if chunk.choices else None
-                delta = getattr(choice.delta, "content", None) if choice else None
-            except AttributeError:
-                delta = None
-            if delta:
-                final_parts.append(delta)
-                try:
+) -> Any:
+    with client.responses.stream(
+        model=model,
+        input=list(payload),
+    ) as stream:
+        for event in stream:
+            if event.type == "response.output_text.delta":
+                delta = getattr(event, "delta", "")
+                if delta:
                     on_delta(delta)
-                except Exception as inner_exc:  # noqa: BLE001
-                    on_error(inner_exc)
-                    return
-            if getattr(chunk, "usage", None):
-                usage_data = chunk.usage
-        result = SimpleNamespace(output_text="".join(final_parts), usage=usage_data)
-        on_done(result)
-    except Exception as exc:  # noqa: BLE001 - surface to UI
-        on_error(exc)
+            elif event.type == "response.error":
+                error_obj = getattr(event, "error", None)
+                if isinstance(error_obj, Exception):
+                    raise error_obj
+                error_message = getattr(error_obj, "message", None) or "Erreur inconnue"
+                exc = RuntimeError(error_message)
+                if error_obj is not None:
+                    setattr(exc, "response", error_obj)
+                raise exc
+        return stream.get_final_response()
+
+
+def chat_stream(
+    client: OpenAI,
+    model: str,
+    payload: Sequence[Dict[str, Any]],
+    on_delta,
+) -> Any:
+    stream = client.chat.completions.create(
+        model=model,
+        messages=list(payload),
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+    final_parts: List[str] = []
+    usage_data = None
+    for chunk in stream:
+        choice = chunk.choices[0] if chunk.choices else None
+        delta = getattr(choice.delta, "content", None) if choice else None
+        if delta:
+            final_parts.append(delta)
+            on_delta(delta)
+        if getattr(chunk, "usage", None):
+            usage_data = chunk.usage
+    return SimpleNamespace(output_text="".join(final_parts), usage=usage_data)
+
+
+def do_call(
+    client: OpenAI,
+    model: str,
+    payload_messages: Sequence[Dict[str, Any]],
+    stream: bool = True,
+    on_delta=None,
+) -> Any:
+    delta_callback = on_delta or (lambda *_args, **_kwargs: None)
+    last_user = next(
+        (message for message in reversed(payload_messages) if message.get("role") == "user"),
+        None,
+    )
+    has_images = _contains_image_parts(last_user)
+
+    if has_images and model not in VISION_MODELS:
+        raise ValueError(
+            "Ce modèle n’accepte pas d’images. Choisissez gpt-4o / gpt-4o-mini / gpt-5."
+        )
+
+    if has_images:
+        payload = to_responses_input(list(payload_messages))
+        if stream:
+            return responses_stream(client, model, payload, delta_callback)
+        return client.responses.create(model=model, input=payload)
+
+    payload = to_chat_messages(list(payload_messages))
+    if stream:
+        return chat_stream(client, model, payload, delta_callback)
+
+    completion = client.chat.completions.create(
+        model=model,
+        messages=payload,
+        stream=False,
+    )
+    final_text_parts: List[str] = []
+    if completion.choices:
+        message = getattr(completion.choices[0], "message", None)
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            final_text_parts.append(content)
+    final_text = "".join(final_text_parts)
+    return SimpleNamespace(output_text=final_text, usage=getattr(completion, "usage", None))
+
+
+def call_with_fallback(
+    client: OpenAI,
+    model: str,
+    payload_messages: Sequence[Dict[str, Any]],
+    use_stream: bool = True,
+    on_delta=None,
+) -> tuple[Any, Dict[str, Any]]:
+    info: Dict[str, Any] = {
+        "model_used": model,
+        "stream_was_used": use_stream,
+        "fallback_applied": False,
+        "stream_disabled": False,
+        "model_changed": False,
+    }
+    try:
+        result = do_call(client, model, payload_messages, stream=use_stream, on_delta=on_delta)
+        return result, info
+    except Exception as e:
+        if is_org_verify_stream_error(e) and use_stream:
+            result = do_call(client, model, payload_messages, stream=False, on_delta=on_delta)
+            info["fallback_applied"] = True
+            info["stream_was_used"] = False
+            info["stream_disabled"] = True
+            return result, info
+        raise
+
+
+def safe_llm_call(
+    client: OpenAI,
+    model: str,
+    payload_messages: Sequence[Dict[str, Any]],
+    stream: bool = True,
+    on_delta=None,
+) -> tuple[Any, Dict[str, Any]]:
+    try:
+        return call_with_fallback(
+            client,
+            model,
+            payload_messages,
+            use_stream=stream,
+            on_delta=on_delta,
+        )
+    except Exception as e1:
+        if not is_org_verify_stream_error(e1):
+            raise
+        for alt in PREFERRED_MODELS:
+            if alt == model:
+                continue
+            try:
+                result, info = call_with_fallback(
+                    client,
+                    alt,
+                    payload_messages,
+                    use_stream=stream,
+                    on_delta=on_delta,
+                )
+                info["fallback_applied"] = True
+                info["model_used"] = alt
+                info["model_changed"] = True
+                return result, info
+            except Exception as e2:
+                if not is_org_verify_stream_error(e2):
+                    raise
+        result, info = call_with_fallback(
+            client,
+            PREFERRED_MODELS[0],
+            payload_messages,
+            use_stream=False,
+            on_delta=on_delta,
+        )
+        info["fallback_applied"] = True
+        info["model_used"] = PREFERRED_MODELS[0]
+        info["model_changed"] = PREFERRED_MODELS[0] != model
+        info["stream_disabled"] = True
+        info["stream_was_used"] = False
+        return result, info
 
 
 def call_llm(
@@ -554,25 +671,26 @@ def call_llm(
     on_delta,
     on_done,
     on_error,
-) -> None:
-    last_user = next(
-        (message for message in reversed(payload_messages) if message.get("role") == "user"),
-        None,
-    )
-    has_images = _contains_image_parts(last_user)
-
-    if has_images and model not in VISION_MODELS:
-        on_error(
-            ValueError(
-                "Ce modèle n’accepte pas d’images. Choisissez gpt-4o / gpt-4o-mini / gpt-5."
-            )
+) -> Optional[Dict[str, Any]]:
+    try:
+        result, info = safe_llm_call(
+            client,
+            model,
+            payload_messages,
+            stream=True,
+            on_delta=on_delta,
         )
-        return
+    except Exception as exc:
+        on_error(exc)
+        return None
 
-    if has_images:
-        stream_via_responses(client, model, payload_messages, on_delta, on_done, on_error)
-    else:
-        stream_via_chat_completions(client, model, payload_messages, on_delta, on_done, on_error)
+    try:
+        on_done(result)
+    except Exception as exc:
+        on_error(exc)
+        return None
+
+    return info
 
 
 CODE_BLOCK_PATTERN = re.compile(r"```([\w+-]*)\n(.*?)```", re.DOTALL)
@@ -1059,6 +1177,7 @@ def _render_chat_interface() -> None:
             answer_box = st.empty()
             sources_placeholder = st.empty()
             usage_placeholder = st.empty()
+            fallback_notice = st.empty()
 
             status_box.info("✍️ L’assistant est en train d’écrire…")
 
@@ -1162,7 +1281,7 @@ def _render_chat_interface() -> None:
                 call_context["response_chars"] = len("".join(acc))
                 st.session_state.last_call_log = call_context
 
-            call_llm(
+            outcome = call_llm(
                 client,
                 selected_model,
                 messages_for_api,
@@ -1170,6 +1289,23 @@ def _render_chat_interface() -> None:
                 on_done,
                 on_error,
             )
+
+            if outcome:
+                effective_model = outcome.get("model_used", selected_model)
+                call_context["effective_model"] = effective_model
+                call_context["stream_was_used"] = outcome.get("stream_was_used", True)
+                call_context["fallback_applied"] = outcome.get("fallback_applied", False)
+                call_context["model_changed"] = outcome.get("model_changed", False)
+                call_context["stream_disabled"] = outcome.get("stream_disabled", False)
+                if outcome.get("fallback_applied"):
+                    fallback_notice.info(
+                        "ℹ️ Le modèle sélectionné requiert une organisation vérifiée pour le streaming. "
+                        "Un fallback a été appliqué (streaming désactivé et/ou modèle alternatif)."
+                    )
+                else:
+                    fallback_notice.empty()
+            else:
+                fallback_notice.empty()
 
         if should_rerun["value"]:
             st.rerun()
