@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from rag_utils import (
+    ALLOW_LARGE_FILES,
+    DEFAULT_MAX_FILE_MB,
     FAISS_IMPORT_ERROR,
     add_embeddings_to_index,
     embed_texts,
@@ -15,6 +17,7 @@ from rag_utils import (
     configure_status_callbacks,
     format_context,
     format_source_badge,
+    format_bytes,
     human_readable_size,
     index_files_from_chat,
     load_file_to_chunks,
@@ -36,7 +39,7 @@ AVAILABLE_MODELS = [
 EMBEDDING_MODEL = "text-embedding-3-large"
 RETRIEVAL_K = 4
 MAX_FILES = 5
-MAX_FILE_SIZE = 20 * 1024 * 1024
+MAX_FILE_BYTES = DEFAULT_MAX_FILE_MB * 1024 * 1024
 CHUNK_MAX_CHARS = 4000
 CHUNK_OVERLAP = 400
 
@@ -115,7 +118,7 @@ def _handle_indexing(uploaded_files: Sequence[Any]) -> None:
         st.warning(f"Merci de limiter l'indexation à {MAX_FILES} fichiers simultanés.")
         return
 
-    oversized: List[str] = []
+    oversized: List[tuple[str, int]] = []
     valid_files = []
     for uploaded_file in uploaded_files:
         size = getattr(uploaded_file, "size", None)
@@ -124,8 +127,8 @@ def _handle_indexing(uploaded_files: Sequence[Any]) -> None:
                 size = len(uploaded_file.getvalue())
             except Exception:
                 size = 0
-        if size and size > MAX_FILE_SIZE:
-            oversized.append(uploaded_file.name)
+        if not ALLOW_LARGE_FILES and size and size > MAX_FILE_BYTES:
+            oversized.append((uploaded_file.name, size))
             continue
         valid_files.append(uploaded_file)
 
@@ -133,8 +136,8 @@ def _handle_indexing(uploaded_files: Sequence[Any]) -> None:
         st.warning(
             "\n".join(
                 [
-                    "Les fichiers suivants dépassent 20 Mo et ont été ignorés :",
-                    *[f"• {name}" for name in oversized],
+                    f"Les fichiers suivants dépassent {DEFAULT_MAX_FILE_MB} Mo et ont été ignorés :",
+                    *[f"• {name} ({format_bytes(size)})" for name, size in oversized],
                 ]
             )
         )
@@ -286,11 +289,15 @@ def _render_sidebar() -> Dict[str, Any]:
         st.markdown("### Données")
         uploaded_files = st.file_uploader(
             "📎 Importer des fichiers",
-            type=["csv", "xlsx", "xls", "pdf", "docx", "txt", "md"],
+            type=["csv", "tsv", "xlsx", "xls", "pdf", "docx", "txt", "md"],
             accept_multiple_files=True,
         )
-        if uploaded_files:
-            st.caption("Jusqu'à 5 fichiers, 20 Mo max chacun.")
+        help_hint = (
+            f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, XLSX, XLS, PDF, DOCX, TXT, MD"
+        )
+        if ALLOW_LARGE_FILES:
+            help_hint += " — Les fichiers plus lourds seront traités par morceaux."
+        st.caption(help_hint)
 
         index_clicked = st.button(
             "Indexer",
@@ -517,9 +524,15 @@ def _render_chat_interface() -> None:
         with st.popover("📎", use_container_width=True):
             files = st.file_uploader(
                 "Importer des fichiers",
-                type=["csv", "xlsx", "xls", "pdf", "docx", "txt", "md"],
+                type=["csv", "tsv", "xlsx", "xls", "pdf", "docx", "txt", "md"],
                 accept_multiple_files=True,
             )
+            help_hint = (
+                f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • CSV, XLSX, XLS, PDF, DOCX, TXT, MD"
+            )
+            if ALLOW_LARGE_FILES:
+                help_hint += " — Les fichiers plus lourds seront traités par morceaux."
+            st.caption(help_hint)
             if files:
                 # ajoute sans dupliquer les mêmes noms+taille
                 existing = {(f.name, f.size) for f in st.session_state.chat_attachments}
@@ -528,10 +541,12 @@ def _render_chat_interface() -> None:
                         if len(st.session_state.chat_attachments) >= MAX_FILES:
                             st.warning(f"Maximum {MAX_FILES} fichiers par envoi.")
                             break
-                        size = getattr(f, "size", None) or len(f.getvalue())
-                        if size > MAX_FILE_SIZE:
+                        size = getattr(f, "size", None)
+                        if size is None:
+                            size = len(f.getvalue())
+                        if not ALLOW_LARGE_FILES and size > MAX_FILE_BYTES:
                             st.warning(
-                                f"{f.name} dépasse la limite de 20 Mo et sera ignoré."
+                                f"{f.name} dépasse la limite de {DEFAULT_MAX_FILE_MB} Mo et sera ignoré."
                             )
                             continue
                         st.session_state.chat_attachments.append(f)
@@ -550,7 +565,13 @@ def _render_chat_interface() -> None:
         chip_cols = st.columns(min(len(st.session_state.chat_attachments), 4))
         for i, f in enumerate(st.session_state.chat_attachments):
             with chip_cols[i % len(chip_cols)]:
-                st.markdown(f"🧩 **{f.name}**  ({round(f.size/1024,1)} Ko)")
+                size = getattr(f, "size", None)
+                if size is None:
+                    try:
+                        size = len(f.getvalue())
+                    except Exception:
+                        size = 0
+                st.markdown(f"🧩 **{f.name}**  ({format_bytes(size)})")
                 if st.button(f"❌ Retirer {i}", key=f"rm_{i}"):
                     st.session_state.chat_attachments.pop(i)
                     st.rerun()
@@ -558,7 +579,7 @@ def _render_chat_interface() -> None:
     if send:
         text_value = user_text.strip() if user_text else ""
         attachments: List[Dict[str, Any]] = []
-        oversized: List[str] = []
+        oversized: List[tuple[str, int]] = []
 
         for upload in list(st.session_state.chat_attachments):
             size = getattr(upload, "size", None)
@@ -567,8 +588,8 @@ def _render_chat_interface() -> None:
                     size = len(upload.getvalue())
                 except Exception:
                     size = 0
-            if size and size > MAX_FILE_SIZE:
-                oversized.append(upload.name)
+            if not ALLOW_LARGE_FILES and size and size > MAX_FILE_BYTES:
+                oversized.append((upload.name, size))
                 continue
             attachments.append({"name": upload.name, "data": upload.getvalue(), "size": size})
 
@@ -578,8 +599,8 @@ def _render_chat_interface() -> None:
             st.warning(
                 "\n".join(
                     [
-                        "Les fichiers suivants dépassent 20 Mo et ont été ignorés :",
-                        *[f"• {name}" for name in oversized],
+                        f"Les fichiers suivants dépassent {DEFAULT_MAX_FILE_MB} Mo et ont été ignorés :",
+                        *[f"• {name} ({format_bytes(size)})" for name, size in oversized],
                     ]
                 )
             )

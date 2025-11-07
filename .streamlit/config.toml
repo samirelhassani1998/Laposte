@@ -7,3 +7,7 @@ font = "Inter"
 
 [client]
 showSidebarNavigation = false
+
+[server]
+# Limite Streamlit en MB. Ajustez si vous relevez MAX_FILE_MB au-delà de 200.
+maxUploadSize = 200
