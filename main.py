@@ -34,6 +34,8 @@ from token_utils import (
     truncate_messages_to_budget,
 )
 from utils.rendering import extract_code_block, try_extract_dbml_heuristic
+from rag.pipeline import run_rag_pipeline
+from rag.retriever import Document
 
 load_dotenv()
 
@@ -55,12 +57,27 @@ VISION_MODELS = {"gpt-4o", "gpt-4o-mini", "gpt-5"}
 MAX_INPUT_TOKENS = 300_000
 RESERVE_OUTPUT_TOKENS = 1_000
 MAX_RAG_CONTEXT_TOKENS = 30_000
-RETRIEVAL_K = 4
 MAX_FILES = 5
 MAX_FILE_BYTES = DEFAULT_MAX_FILE_MB * 1024 * 1024
 CHUNK_MAX_CHARS = 4000
 CHUNK_OVERLAP = 400
 MAX_IMAGE_ATTACHMENTS = 5
+
+
+try:  # pragma: no cover - optional dependency check
+    import torch  # type: ignore
+except Exception:  # pragma: no cover - torch absent
+    TORCH_AVAILABLE = False
+else:  # pragma: no cover - torch present
+    TORCH_AVAILABLE = True
+
+
+DEFAULT_RETRIEVAL_K = 8
+DEFAULT_TEMPERATURE = 0.7
+DEFAULT_TOP_P = 0.95
+DEFAULT_MAX_TOKENS = 2000
+MAX_TOKENS_MIN = 512
+MAX_TOKENS_MAX = 8192
 
 
 BASE_GLOBAL_SYSTEM_PROMPT = (
@@ -130,6 +147,20 @@ def _init_session_state() -> None:
         st.session_state.rag_docs = []
     if "rag_embedding_model" not in st.session_state:
         st.session_state.rag_embedding_model = EMBEDDING_MODEL
+    if "rag_retrieval_k" not in st.session_state:
+        st.session_state.rag_retrieval_k = DEFAULT_RETRIEVAL_K
+    if "generation_temperature" not in st.session_state:
+        st.session_state.generation_temperature = DEFAULT_TEMPERATURE
+    if "generation_top_p" not in st.session_state:
+        st.session_state.generation_top_p = DEFAULT_TOP_P
+    if "generation_max_tokens" not in st.session_state:
+        st.session_state.generation_max_tokens = DEFAULT_MAX_TOKENS
+    if "rag_enable_multipass" not in st.session_state:
+        st.session_state.rag_enable_multipass = True
+    if "rag_enable_rerank" not in st.session_state:
+        st.session_state.rag_enable_rerank = TORCH_AVAILABLE
+    if "rag_diagnostics" not in st.session_state:
+        st.session_state.rag_diagnostics = None
     if "chat_attachments" not in st.session_state:
         st.session_state.chat_attachments = []
     if "chat_images" not in st.session_state:
@@ -150,6 +181,7 @@ def _reset_rag_state() -> None:
     st.session_state.rag_meta = []
     st.session_state.rag_docs = []
     st.session_state.rag_embedding_model = EMBEDDING_MODEL
+    st.session_state.rag_diagnostics = None
 
 
 def _remove_api_key() -> None:
@@ -161,6 +193,50 @@ def _remove_api_key() -> None:
 
 def _rag_is_ready() -> bool:
     return bool(st.session_state.rag_index is not None and st.session_state.rag_texts)
+
+
+class SessionVectorStore:
+    """Lightweight adapter exposing a similarity_search interface for the RAG pipeline."""
+
+    def __init__(
+        self,
+        client: OpenAI,
+        index,
+        texts: Sequence[str],
+        metas: Sequence[Dict[str, Any]],
+        embedding_model: str,
+    ) -> None:
+        self._client = client
+        self._index = index
+        self._texts = list(texts or [])
+        self._metas = list(metas or [])
+        self._embedding_model = embedding_model or EMBEDDING_MODEL
+
+    def similarity_search(self, query: str, k: int = 8) -> List[Document]:
+        if self._index is None or not self._texts:
+            return []
+        query_embedding = embed_texts(self._client, self._embedding_model, [query])
+        if getattr(query_embedding, "size", 0) == 0:
+            return []
+        limit = min(k, len(self._texts))
+        if limit <= 0:
+            return []
+        _distances, indices = self._index.search(query_embedding, limit)
+        documents: List[Document] = []
+        seen: set[int] = set()
+        for idx in indices[0]:
+            if idx < 0 or idx >= len(self._texts) or idx in seen:
+                continue
+            seen.add(int(idx))
+            documents.append(
+                Document(
+                    page_content=self._texts[idx],
+                    metadata=dict(self._metas[idx] or {}),
+                )
+            )
+            if len(documents) >= limit:
+                break
+        return documents
 
 
 def _format_sources_line(sources: Sequence[Dict[str, Any]]) -> str:
@@ -414,6 +490,75 @@ def _render_sidebar() -> Dict[str, Any]:
             st.caption("Aucun document indexé.")
 
         st.markdown("---")
+        st.markdown("### Paramètres RAG & génération")
+        st.session_state.rag_retrieval_k = st.slider(
+            "k (passages)",
+            min_value=1,
+            max_value=20,
+            value=int(st.session_state.rag_retrieval_k or DEFAULT_RETRIEVAL_K),
+        )
+        st.session_state.generation_temperature = st.slider(
+            "Température",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(st.session_state.generation_temperature or DEFAULT_TEMPERATURE),
+            step=0.05,
+        )
+        st.session_state.generation_top_p = st.slider(
+            "Top-p",
+            min_value=0.1,
+            max_value=1.0,
+            value=float(st.session_state.generation_top_p or DEFAULT_TOP_P),
+            step=0.01,
+        )
+        st.session_state.generation_max_tokens = st.slider(
+            "Max tokens",
+            min_value=MAX_TOKENS_MIN,
+            max_value=MAX_TOKENS_MAX,
+            value=int(st.session_state.generation_max_tokens or DEFAULT_MAX_TOKENS),
+            step=128,
+        )
+        st.session_state.rag_enable_multipass = st.checkbox(
+            "Activer multi-pass (2 passes)",
+            value=bool(st.session_state.rag_enable_multipass),
+        )
+        rerank_disabled = not TORCH_AVAILABLE
+        rerank_value = st.checkbox(
+            "Activer reranking Cross-Encoder",
+            value=bool(st.session_state.rag_enable_rerank and not rerank_disabled),
+            disabled=rerank_disabled,
+        )
+        st.session_state.rag_enable_rerank = bool(rerank_value and not rerank_disabled)
+        if rerank_disabled:
+            st.caption("Cross-Encoder indisponible (torch manquant ou non pris en charge).")
+
+        with st.expander("Diagnostics", expanded=False):
+            diag = st.session_state.get("rag_diagnostics") or {}
+            if not diag:
+                st.caption("Aucun diagnostic RAG pour le moment.")
+            else:
+                lines = [
+                    f"- Modèle : {diag.get('model', '-')}",
+                    f"- k : {diag.get('k', '-')}",
+                    f"- Temps retrieval : {diag.get('retrieval_time_s', '-')} s",
+                ]
+                if diag.get("pass1_time_s") is not None:
+                    lines.append(f"- Pass 1 : {diag['pass1_time_s']} s")
+                if diag.get("pass2_time_s") is not None:
+                    lines.append(f"- Pass 2 : {diag['pass2_time_s']} s")
+                if diag.get("pass2_skipped"):
+                    lines.append("- Pass 2 désactivé")
+                if diag.get("history_chars"):
+                    lines.append(f"- Résumé historique : {diag['history_chars']} caractères")
+                pass1_tokens = (diag.get("pass1_usage") or {}).get("completion_tokens")
+                pass2_tokens = (diag.get("pass2_usage") or {}).get("completion_tokens")
+                if pass1_tokens:
+                    lines.append(f"- Tokens pass 1 : {pass1_tokens}")
+                if pass2_tokens:
+                    lines.append(f"- Tokens pass 2 : {pass2_tokens}")
+                st.markdown("\n".join(lines))
+
+        st.markdown("---")
         show_logs = st.checkbox(
             "Afficher les logs",
             value=st.session_state.show_logs,
@@ -472,6 +617,13 @@ def _render_sidebar() -> Dict[str, Any]:
                     lines.append(f"- **Sources citées :** {log['sources_count']}")
                 if log.get("error"):
                     lines.append(f"- **Erreur :** {log['error']}")
+                diag = log.get("pipeline_diagnostics") or {}
+                if diag:
+                    lines.append(
+                        f"- **RAG (pipeline)** : retrieval {diag.get('retrieval_time_s', '-')} s, pass1 {diag.get('pass1_time_s', '-')} s"
+                    )
+                    if diag.get("pass2_time_s") is not None:
+                        lines.append(f"  - Pass2 : {diag.get('pass2_time_s')} s")
                 st.markdown("\n".join(lines))
                 if log.get("error"):
                     st.caption(
@@ -941,7 +1093,7 @@ def _render_chat_interface() -> None:
     st.markdown("<div class='chat-header'>ChatGPT-like Chatbot</div>", unsafe_allow_html=True)
 
     if _rag_is_ready():
-        st.markdown(f"🧠 RAG actif (k={RETRIEVAL_K})")
+        st.markdown(f"🧠 RAG actif (k={st.session_state.rag_retrieval_k})")
 
     for message in st.session_state.messages:
         if message["role"] == "system":
@@ -1209,6 +1361,118 @@ def _render_chat_interface() -> None:
             for warn in indexing_stats["warnings"]:
                 st.warning(warn)
 
+        client = OpenAI(api_key=st.session_state.api_key)
+        use_rag = _rag_is_ready()
+        if not use_rag:
+            st.session_state.rag_diagnostics = None
+        is_multimodal_request = bool(image_parts)
+        query_for_rag = text_value or "Résume/analyse les documents joints."
+        pipeline_result: Optional[Dict[str, Any]] = None
+        pipeline_sources_info: List[Dict[str, Any]] = []
+
+        if use_rag and not is_multimodal_request:
+            vectorstore = SessionVectorStore(
+                client,
+                st.session_state.rag_index,
+                st.session_state.rag_texts,
+                st.session_state.rag_meta,
+                st.session_state.rag_embedding_model or EMBEDDING_MODEL,
+            )
+            try:
+                pipeline_result = run_rag_pipeline(
+                    client,
+                    selected_model,
+                    vectorstore,
+                    query_for_rag,
+                    st.session_state.messages,
+                    k=int(st.session_state.rag_retrieval_k or DEFAULT_RETRIEVAL_K),
+                    temperature=float(
+                        st.session_state.generation_temperature or DEFAULT_TEMPERATURE
+                    ),
+                    top_p=float(st.session_state.generation_top_p or DEFAULT_TOP_P),
+                    max_tokens=int(
+                        st.session_state.generation_max_tokens or DEFAULT_MAX_TOKENS
+                    ),
+                    enable_multipass=bool(st.session_state.rag_enable_multipass),
+                    enable_rerank=bool(st.session_state.rag_enable_rerank),
+                )
+                st.session_state.rag_diagnostics = pipeline_result.get("diagnostics")
+            except Exception as error:  # noqa: BLE001 - fallback to classic path
+                st.warning(f"Pipeline RAG indisponible : {error}")
+                st.session_state.rag_diagnostics = None
+                pipeline_result = None
+
+        if pipeline_result and pipeline_result.get("answer"):
+            final_text = pipeline_result.get("answer", "")
+            usage_data = pipeline_result.get("usage")
+            docs = pipeline_result.get("documents") or []
+            for idx, doc in enumerate(docs, start=1):
+                meta = getattr(doc, "metadata", None) or {}
+                pipeline_sources_info.append({"index": idx, "meta": meta})
+
+            with st.chat_message("assistant"):
+                preferred_lang = "dbml" if dbml_requested else None
+                render_opts: Dict[str, Any] = {}
+                if dbml_requested:
+                    render_opts = {"preferred_lang": preferred_lang, "dbml_mode": True}
+                _render_message_content(
+                    final_text,
+                    role="assistant",
+                    preferred_lang=preferred_lang,
+                    dbml_mode=dbml_requested,
+                )
+                if pipeline_sources_info:
+                    st.markdown(
+                        "Sources : "
+                        + " • ".join(
+                            [
+                                format_source_badge(info["meta"], info["index"])
+                                for info in pipeline_sources_info
+                            ]
+                        )
+                    )
+                usage_text = _format_usage(usage_data)
+                if usage_text:
+                    st.caption(usage_text)
+
+            message_entry: Dict[str, Any] = {
+                "role": "assistant",
+                "content": final_text,
+                "usage": usage_data,
+                "sources": pipeline_sources_info or None,
+            }
+            if render_opts:
+                message_entry["render_options"] = render_opts
+            st.session_state.messages.append(message_entry)
+
+            call_context: Dict[str, Any] = {
+                "model": selected_model,
+                "call_type": "RAG Pipeline",
+                "messages_count": len(st.session_state.messages),
+                "prompt_tokens_before": None,
+                "prompt_tokens_after": None,
+                "truncated_context": False,
+                "truncated_history": False,
+                "image_count": len(image_stats),
+                "images": image_stats,
+                "attachments_count": len(attachments or []),
+                "rag_used": bool(pipeline_sources_info),
+                "rag_hits": len(pipeline_sources_info),
+                "sources_count": len(pipeline_sources_info),
+                "usage": usage_data,
+                "response_chars": len(final_text or ""),
+                "status": "success",
+                "pipeline_diagnostics": pipeline_result.get("diagnostics"),
+                "temperature": st.session_state.generation_temperature,
+                "top_p": st.session_state.generation_top_p,
+                "max_tokens": st.session_state.generation_max_tokens,
+                "rag_k": st.session_state.rag_retrieval_k,
+                "multipass": st.session_state.rag_enable_multipass,
+                "rerank": st.session_state.rag_enable_rerank,
+            }
+            st.session_state.last_call_log = call_context
+            return
+
         _ensure_global_system_message()
 
         messages_for_api = [
@@ -1216,14 +1480,12 @@ def _render_chat_interface() -> None:
             for msg in st.session_state.messages
         ]
 
-        client = OpenAI(api_key=st.session_state.api_key)
         sources_info: List[Dict[str, Any]] = []
 
-        use_rag = _rag_is_ready()
         hits: List[Any] = []
         if use_rag:
             try:
-                query = text_value or "Résume/analyse les documents joints."
+                query = query_for_rag
                 hits = retrieve(
                     client,
                     query,
@@ -1231,7 +1493,7 @@ def _render_chat_interface() -> None:
                     st.session_state.rag_texts,
                     st.session_state.rag_meta,
                     st.session_state.rag_embedding_model or EMBEDDING_MODEL,
-                    k=RETRIEVAL_K,
+                    k=int(st.session_state.rag_retrieval_k or DEFAULT_RETRIEVAL_K),
                 )
             except Exception as error:  # noqa: BLE001 - surface gracefully
                 st.warning(f"Recherche contextuelle indisponible : {error}")
@@ -1291,6 +1553,13 @@ def _render_chat_interface() -> None:
             "rag_hits": len(hits),
             "sources_count": len(sources_info),
             "usage": None,
+            "temperature": st.session_state.generation_temperature,
+            "top_p": st.session_state.generation_top_p,
+            "max_tokens": st.session_state.generation_max_tokens,
+            "rag_k": st.session_state.rag_retrieval_k,
+            "multipass": st.session_state.rag_enable_multipass,
+            "rerank": st.session_state.rag_enable_rerank,
+            "pipeline_diagnostics": st.session_state.get("rag_diagnostics"),
         }
 
         with st.chat_message("assistant"):
