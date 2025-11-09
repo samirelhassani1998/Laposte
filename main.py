@@ -4,6 +4,7 @@ import urllib.parse as _url
 from html import escape
 from typing import Any, Dict, List, Optional, Sequence
 from types import SimpleNamespace
+from dataclasses import replace
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -37,21 +38,34 @@ from utils.rendering import extract_code_block, try_extract_dbml_heuristic
 from rag.pipeline import run_rag_pipeline
 from rag.retriever import Document
 from quality.escalation import need_quality_escalation, output_is_poor, expects_dbml
+from config import PerfConfig
 
 load_dotenv()
 
 st.set_page_config(page_title="ChatGPT-like Chatbot", layout="wide")
 
-if "mode" not in st.session_state:
-    st.session_state.mode = "performance"
-if "model_default_set" not in st.session_state:
-    st.session_state.model_default_set = False
-if "mode_defaults_applied_for" not in st.session_state:
-    st.session_state.mode_defaults_applied_for = None
-if "ui_mode_selector" not in st.session_state:
-    st.session_state.ui_mode_selector = "Performance"
-if "quality_escalated" not in st.session_state:
-    st.session_state.quality_escalated = False
+if "app_config" not in st.session_state:
+    base_cfg = PerfConfig()
+    if os.getenv("QUALITY_ESCALATION", "0") == "1":
+        base_cfg = PerfConfig(quality_escalation=True)
+    st.session_state.app_config = base_cfg
+
+CFG: PerfConfig = st.session_state.app_config
+
+
+def perf_params_to_state_bridge() -> None:
+    st.session_state.setdefault("selected_model", CFG.default_model)
+    st.session_state.setdefault("rag_k", CFG.rag_k)
+    st.session_state.setdefault("use_multipass", CFG.use_multipass)
+    st.session_state.setdefault("use_reranker", CFG.use_reranker)
+    st.session_state.setdefault("gen_temperature", CFG.temperature)
+    st.session_state.setdefault("gen_top_p", CFG.top_p)
+    st.session_state.setdefault("gen_max_tokens", CFG.max_tokens)
+    st.session_state.setdefault("mode", "performance")
+    st.session_state.setdefault("quality_escalated", False)
+
+
+perf_params_to_state_bridge()
 
 AVAILABLE_MODELS = [
     "gpt-4o",
@@ -121,34 +135,22 @@ DBML_ENFORCEMENT_PROMPT = (
 )
 
 
-def effective_params_from_mode() -> Dict[str, Any]:
-    perf = st.session_state.mode == "performance"
-    params = {
-        "k": st.session_state.get("rag_k", PERFORMANCE_DEFAULT_K if perf else DEFAULT_RETRIEVAL_K),
-        "use_multipass": st.session_state.get("use_multipass", not perf),
-        "use_reranker": st.session_state.get("use_reranker", not perf),
-        "temperature": st.session_state.get("gen_temperature", PERFORMANCE_DEFAULT_TEMPERATURE if perf else DEFAULT_TEMPERATURE),
-        "top_p": st.session_state.get("gen_top_p", PERFORMANCE_DEFAULT_TOP_P if perf else DEFAULT_TOP_P),
-        "max_tokens": st.session_state.get("gen_max_tokens", PERFORMANCE_DEFAULT_MAX_TOKENS if perf else DEFAULT_MAX_TOKENS),
-        "mode": "performance" if perf else "qualite",
-    }
-    return params
+def effective_params_from_mode() -> PerfConfig:
+    return CFG
 
 
-def with_quality_boost(params: Dict[str, Any]) -> Dict[str, Any]:
-    boosted = params.copy()
-    boosted.update(
-        {
-            "k": max(int(params.get("k", 0)), 8),
-            "use_multipass": True,
-            "use_reranker": True,
-            "max_tokens": max(int(params.get("max_tokens", 0)), 2000),
-            "temperature": max(float(params.get("temperature", 0.0)), 0.7),
-            "top_p": max(float(params.get("top_p", 0.0)), 0.95),
-            "mode": "qualite",
-        }
+def with_quality_boost(params: PerfConfig) -> PerfConfig:
+    if not CFG.quality_escalation:
+        return params
+    return replace(
+        params,
+        rag_k=max(params.rag_k, 8),
+        use_multipass=True,
+        use_reranker=True,
+        max_tokens=max(params.max_tokens, 2000),
+        temperature=max(params.temperature, 0.7),
+        top_p=max(params.top_p, 0.95),
     )
-    return boosted
 
 
 def _contains_image_parts(message: Optional[Dict[str, Any]]) -> bool:
@@ -183,7 +185,7 @@ def _init_session_state() -> None:
     if "messages" not in st.session_state:
         st.session_state.messages = [dict(GLOBAL_SYSTEM_MESSAGE)]
     if "selected_model" not in st.session_state:
-        st.session_state.selected_model = AVAILABLE_MODELS[0]
+        st.session_state.selected_model = CFG.default_model
     if "rag_index" not in st.session_state:
         st.session_state.rag_index = None
     if "rag_texts" not in st.session_state:
@@ -227,35 +229,8 @@ def _remove_api_key() -> None:
 
 
 def set_defaults_if_needed(*, force: bool = False) -> None:
-    perf = st.session_state.mode == "performance"
-
-    if not st.session_state.model_default_set:
-        try:
-            st.session_state.selected_model = "gpt-4o-mini"
-        except Exception:
-            pass
-        st.session_state.model_default_set = True
-
-    def set_value(key: str, val: Any) -> None:
-        if force or key not in st.session_state:
-            st.session_state[key] = val
-
-    if perf:
-        set_value("rag_k", PERFORMANCE_DEFAULT_K)
-        set_value("use_multipass", False)
-        set_value("use_reranker", False)
-        set_value("gen_max_tokens", PERFORMANCE_DEFAULT_MAX_TOKENS)
-        set_value("gen_temperature", PERFORMANCE_DEFAULT_TEMPERATURE)
-        set_value("gen_top_p", PERFORMANCE_DEFAULT_TOP_P)
-    else:
-        set_value("rag_k", DEFAULT_RETRIEVAL_K)
-        set_value("use_multipass", True)
-        set_value("use_reranker", TORCH_AVAILABLE)
-        set_value("gen_max_tokens", DEFAULT_MAX_TOKENS)
-        set_value("gen_temperature", DEFAULT_TEMPERATURE)
-        set_value("gen_top_p", DEFAULT_TOP_P)
-
-    st.session_state.mode_defaults_applied_for = st.session_state.mode
+    _ = force
+    perf_params_to_state_bridge()
 
 
 def _rag_is_ready() -> bool:
@@ -504,8 +479,7 @@ def _render_sidebar() -> Dict[str, Any]:
             default_index = AVAILABLE_MODELS.index(st.session_state.selected_model)
         except ValueError:
             default_index = 0
-        model = st.selectbox("Modèle", AVAILABLE_MODELS, index=default_index)
-        st.session_state.selected_model = model
+        st.selectbox("Modèle", AVAILABLE_MODELS, index=default_index, key="selected_model")
 
         st.button("Nouvelle conversation", on_click=_reset_chat)
         st.button("Changer de clé API", on_click=_remove_api_key)
@@ -569,80 +543,10 @@ def _render_sidebar() -> Dict[str, Any]:
             st.caption("Aucun document indexé.")
 
         st.markdown("---")
-        st.markdown("### Paramètres RAG & génération")
-        current_mode_index = 0 if st.session_state.mode == "performance" else 1
-        mode_choice = st.radio(
-            "🎛️ Mode",
-            ["Performance", "Qualité"],
-            horizontal=True,
-            index=current_mode_index,
-            key="ui_mode_selector",
-        )
-        st.session_state.mode = "performance" if mode_choice == "Performance" else "qualite"
-
-        if st.session_state.get("mode_defaults_applied_for") != st.session_state.mode:
-            set_defaults_if_needed(force=True)
-        else:
-            set_defaults_if_needed()
-
-        st.caption(
-            "⚡ Performance" if st.session_state.mode == "performance" else "🔎 Qualité"
-        )
-        if st.session_state.get("quality_escalated"):
-            st.caption("Qualité auto activée pour cette requête (DBML/Code/Analyse détecté)")
-
-        st.slider(
-            "k (passages)",
-            min_value=1,
-            max_value=20,
-            value=int(st.session_state.get("rag_k", PERFORMANCE_DEFAULT_K)),
-            key="rag_k",
-        )
-        st.slider(
-            "Température",
-            min_value=0.0,
-            max_value=1.0,
-            value=float(st.session_state.get("gen_temperature", DEFAULT_TEMPERATURE)),
-            step=0.05,
-            key="gen_temperature",
-        )
-        st.slider(
-            "Top-p",
-            min_value=0.1,
-            max_value=1.0,
-            value=float(st.session_state.get("gen_top_p", DEFAULT_TOP_P)),
-            step=0.01,
-            key="gen_top_p",
-        )
-        st.slider(
-            "Max tokens",
-            min_value=MAX_TOKENS_MIN,
-            max_value=MAX_TOKENS_MAX,
-            value=int(st.session_state.get("gen_max_tokens", DEFAULT_MAX_TOKENS)),
-            step=128,
-            key="gen_max_tokens",
-        )
-        st.checkbox(
-            "Activer multi-pass (2 passes)",
-            value=bool(st.session_state.get("use_multipass", True)),
-            key="use_multipass",
-        )
-        rerank_disabled = (st.session_state.mode == "performance") or (not TORCH_AVAILABLE)
-        st.checkbox(
-            "Activer reranking Cross-Encoder",
-            value=bool(st.session_state.get("use_reranker", False) and TORCH_AVAILABLE),
-            key="use_reranker",
-            disabled=rerank_disabled,
-        )
-        if rerank_disabled:
-            st.session_state.use_reranker = False
-            if not TORCH_AVAILABLE:
-                st.caption("Cross-Encoder indisponible (torch manquant ou non pris en charge).")
-
-        if st.session_state.mode == "performance":
-            st.caption(
-                "Optimisations actives : k=4, MMR, pas de multi-pass, pas de reranking, max_tokens=900"
-            )
+        st.markdown("### Mode performance")
+        st.caption("⚡ Mode performance activé : paramètres RAG & génération optimisés par défaut.")
+        if CFG.quality_escalation:
+            st.caption("La qualité automatique peut s'activer en arrière-plan si nécessaire.")
 
         with st.expander("Diagnostics", expanded=False):
             diag = st.session_state.get("rag_diagnostics") or {}
@@ -674,25 +578,21 @@ def _render_sidebar() -> Dict[str, Any]:
                 st.markdown("\n".join(lines))
 
         st.markdown("---")
-        show_logs = st.checkbox(
+        st.checkbox(
             "Afficher les logs",
-            value=st.session_state.show_logs,
+            key="show_logs",
         )
-        st.session_state.show_logs = show_logs
-        if show_logs:
+        if st.session_state.show_logs:
             st.markdown("### Logs")
             log = st.session_state.last_call_log
             if not log:
                 st.caption("Aucun appel récent.")
             else:
-                lines: List[str] = []
-                lines.append(f"- **Modèle :** {log.get('model', '-')}")
+                lines = [f"- **Modèle :** {log.get('model', '-')}"]
                 if log.get("mode"):
                     lines.append(f"- **Mode :** {log.get('mode')}")
                 lines.append(f"- **Type d’appel :** {log.get('call_type', '-')}")
-                lines.append(
-                    f"- **Messages envoyés :** {log.get('messages_count', 0)}"
-                )
+                lines.append(f"- **Messages envoyés :** {log.get('messages_count', 0)}")
                 tokens_before = log.get("prompt_tokens_before")
                 tokens_after = log.get("prompt_tokens_after")
                 if tokens_before and tokens_before != tokens_after:
@@ -701,9 +601,7 @@ def _render_sidebar() -> Dict[str, Any]:
                     )
                 elif tokens_after is not None:
                     lines.append(f"- **Tokens invite estimés :** {tokens_after}")
-                lines.append(
-                    f"- **RAG :** {'oui' if log.get('rag_used') else 'non'}"
-                )
+                lines.append(f"- **RAG :** {'oui' if log.get('rag_used') else 'non'}")
                 if log.get("rag_hits"):
                     lines.append(f"  - {log['rag_hits']} extraits")
                 if log.get("truncated_context"):
@@ -1210,7 +1108,7 @@ def _render_chat_interface() -> None:
     st.markdown("<div class='chat-header'>ChatGPT-like Chatbot</div>", unsafe_allow_html=True)
 
     if _rag_is_ready():
-        st.markdown(f"🧠 RAG actif (k={st.session_state.get('rag_k', PERFORMANCE_DEFAULT_K)})")
+        st.markdown(f"🧠 RAG actif (k={CFG.rag_k})")
 
     for message in st.session_state.messages:
         if message["role"] == "system":
@@ -1495,31 +1393,28 @@ def _render_chat_interface() -> None:
                 st.session_state.rag_embedding_model or EMBEDDING_MODEL,
             )
 
-            params = effective_params_from_mode()
+            base_cfg = effective_params_from_mode()
+            active_cfg = base_cfg
             quality_applied = False
 
-            def _run_with(p: Dict[str, Any]) -> Dict[str, Any]:
+            def _run_with_cfg(cfg: PerfConfig) -> Dict[str, Any]:
                 return run_rag_pipeline(
                     client,
                     selected_model,
                     vectorstore,
                     query_for_rag,
                     st.session_state.messages,
-                    k=int(p.get("k", PERFORMANCE_DEFAULT_K)),
-                    temperature=float(p.get("temperature", DEFAULT_TEMPERATURE)),
-                    top_p=float(p.get("top_p", DEFAULT_TOP_P)),
-                    max_tokens=int(p.get("max_tokens", DEFAULT_MAX_TOKENS)),
-                    enable_multipass=bool(p.get("use_multipass", True)),
-                    enable_rerank=bool(p.get("use_reranker", False)),
-                    mode=p.get("mode", st.session_state.mode),
+                    cfg=cfg,
                 )
 
             try:
-                if need_quality_escalation(text_value or query_for_rag, use_rag):
-                    params = with_quality_boost(params)
-                    quality_applied = True
+                if CFG.quality_escalation and need_quality_escalation(text_value or query_for_rag, use_rag):
+                    boosted_cfg = with_quality_boost(base_cfg)
+                    if boosted_cfg != base_cfg:
+                        active_cfg = boosted_cfg
+                        quality_applied = True
 
-                pipeline_result = _run_with(params)
+                pipeline_result = _run_with_cfg(active_cfg)
                 st.session_state.rag_diagnostics = pipeline_result.get("diagnostics")
 
                 final_answer_text = pipeline_result.get("answer", "") if pipeline_result else ""
@@ -1527,12 +1422,13 @@ def _render_chat_interface() -> None:
                     pipeline_result
                     and output_is_poor(final_answer_text, expect_dbml=dbml_requested)
                     and not quality_applied
+                    and CFG.quality_escalation
                 ):
-                    boosted_params = with_quality_boost(params)
-                    if boosted_params != params:
-                        params = boosted_params
+                    boosted_cfg = with_quality_boost(active_cfg)
+                    if boosted_cfg != active_cfg:
+                        active_cfg = boosted_cfg
                         quality_applied = True
-                        pipeline_result = _run_with(params)
+                        pipeline_result = _run_with_cfg(active_cfg)
                         st.session_state.rag_diagnostics = pipeline_result.get("diagnostics")
 
                 st.session_state.quality_escalated = quality_applied
@@ -1540,6 +1436,7 @@ def _render_chat_interface() -> None:
                 st.warning(f"Pipeline RAG indisponible : {error}")
                 st.session_state.rag_diagnostics = None
                 pipeline_result = None
+                active_cfg = base_cfg
 
         if pipeline_result and pipeline_result.get("answer"):
             final_text = pipeline_result.get("answer", "")
@@ -1602,13 +1499,13 @@ def _render_chat_interface() -> None:
                 "response_chars": len(final_text or ""),
                 "status": "success",
                 "pipeline_diagnostics": pipeline_result.get("diagnostics"),
-                "temperature": st.session_state.get("gen_temperature", DEFAULT_TEMPERATURE),
-                "top_p": st.session_state.get("gen_top_p", DEFAULT_TOP_P),
-                "max_tokens": st.session_state.get("gen_max_tokens", DEFAULT_MAX_TOKENS),
-                "rag_k": st.session_state.get("rag_k", PERFORMANCE_DEFAULT_K),
-                "multipass": st.session_state.get("use_multipass", True),
-                "rerank": st.session_state.get("use_reranker", False),
-                "mode": st.session_state.mode,
+                "temperature": active_cfg.temperature,
+                "top_p": active_cfg.top_p,
+                "max_tokens": active_cfg.max_tokens,
+                "rag_k": active_cfg.rag_k,
+                "multipass": active_cfg.use_multipass,
+                "rerank": active_cfg.use_reranker,
+                "mode": "performance",
             }
             st.session_state.last_call_log = call_context
             return
@@ -1633,7 +1530,7 @@ def _render_chat_interface() -> None:
                     st.session_state.rag_texts,
                     st.session_state.rag_meta,
                     st.session_state.rag_embedding_model or EMBEDDING_MODEL,
-                    k=int(st.session_state.get("rag_k", PERFORMANCE_DEFAULT_K)),
+                    k=CFG.rag_k,
                 )
             except Exception as error:  # noqa: BLE001 - surface gracefully
                 st.warning(f"Recherche contextuelle indisponible : {error}")
@@ -1693,13 +1590,13 @@ def _render_chat_interface() -> None:
             "rag_hits": len(hits),
             "sources_count": len(sources_info),
             "usage": None,
-            "temperature": st.session_state.get("gen_temperature", DEFAULT_TEMPERATURE),
-            "top_p": st.session_state.get("gen_top_p", DEFAULT_TOP_P),
-            "max_tokens": st.session_state.get("gen_max_tokens", DEFAULT_MAX_TOKENS),
-            "rag_k": st.session_state.get("rag_k", PERFORMANCE_DEFAULT_K),
-            "multipass": st.session_state.get("use_multipass", True),
-            "rerank": st.session_state.get("use_reranker", False),
-            "mode": st.session_state.mode,
+            "temperature": CFG.temperature,
+            "top_p": CFG.top_p,
+            "max_tokens": CFG.max_tokens,
+            "rag_k": CFG.rag_k,
+            "multipass": CFG.use_multipass,
+            "rerank": CFG.use_reranker,
+            "mode": "performance",
             "pipeline_diagnostics": st.session_state.get("rag_diagnostics"),
         }
 

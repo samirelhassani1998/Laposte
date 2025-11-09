@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Sequence, Tuple
 
+from config import PerfConfig
 
 @dataclass
 class Document:
@@ -53,56 +54,58 @@ def _bm25_rerank(query: str, docs: Sequence[Document], k: int) -> List[Document]
 def retrieve(
     vectorstore,
     query: str,
-    k: int = 8,
-    *,
-    mode: str = "performance",
-    enable_rerank: bool = True,
+    k: int,
+    cfg: PerfConfig,
 ) -> List[Document]:
-    """Return the top-k documents for the query, applying mode-specific logic."""
+    """Return the top-k documents using configuration-driven logic."""
 
     if vectorstore is None:
         return []
 
+    target_k = max(int(k or 0), 1)
     docs: Sequence[Document] = []
 
-    if mode == "performance":
-        fetch_k = max(24, k * 6)
+    if cfg.use_mmr:
+        fetch_k = max(cfg.mmr_fetch_k, target_k * 6)
         try:
             docs = vectorstore.max_marginal_relevance_search(
                 query,
-                k=k,
+                k=target_k,
                 fetch_k=fetch_k,
-                lambda_mult=0.5,
+                lambda_mult=cfg.mmr_lambda,
             )
         except Exception:
             try:
-                docs = vectorstore.similarity_search(query, k=k)
+                docs = vectorstore.similarity_search(query, k=target_k)
             except Exception:
                 docs = []
         docs = [doc for doc in docs if doc and getattr(doc, "page_content", None)]
-        return list(docs[:k])
+        return list(docs[:target_k])
 
-    fetch_k = max(k * 3, k)
-    docs = vectorstore.similarity_search(query, k=fetch_k) or []
+    fetch_k = max(target_k * 3, target_k)
+    try:
+        docs = vectorstore.similarity_search(query, k=fetch_k) or []
+    except Exception:
+        docs = []
     docs = [doc for doc in docs if doc and getattr(doc, "page_content", None)]
     if not docs:
         return []
 
-    if enable_rerank:
-        model = _get_cross_encoder()
-        if model is not None:
-            pairs = [(query, doc.page_content) for doc in docs]
-            try:
-                scores = model.predict(pairs)
-            except Exception:  # pragma: no cover - inference failure
-                reranked = _bm25_rerank(query, docs, k)
-            else:
-                ranked = sorted(zip(docs, scores), key=lambda item: item[1], reverse=True)
-                reranked = [doc for doc, _ in ranked[:k]]
+    if not cfg.use_reranker:
+        return list(docs[:target_k])
+
+    model = _get_cross_encoder()
+    if model is not None:
+        pairs = [(query, doc.page_content) for doc in docs]
+        try:
+            scores = model.predict(pairs)
+        except Exception:  # pragma: no cover - inference failure
+            reranked = _bm25_rerank(query, docs, target_k)
         else:
-            reranked = _bm25_rerank(query, docs, k)
+            ranked = sorted(zip(docs, scores), key=lambda item: item[1], reverse=True)
+            reranked = [doc for doc, _ in ranked[:target_k]]
     else:
-        reranked = list(docs[:k])
+        reranked = _bm25_rerank(query, docs, target_k)
 
     return reranked
 
