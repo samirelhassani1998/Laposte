@@ -81,7 +81,9 @@ CHAT_IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "webp", "gif"]
 CHAT_FILE_EXTENSIONS = CHAT_DOCUMENT_EXTENSIONS + CHAT_IMAGE_EXTENSIONS
 
 SIDEBAR_UPLOAD_KEY = "sidebar_uploaded_files"
-CHAT_FILE_UPLOAD_KEY = "chat_file_uploader"
+CHAT_FILE_UPLOAD_KEY = "chat_file_uploader"  # Legacy key retained for compatibility
+CHAT_FILE_UPLOAD_WIDGET_KEY = "chat_file_upload_widget"
+CHAT_FILE_BUFFER_KEY = "chat_file_buffer"
 
 RAG_DEFAULTS = {
     "k": CFG.rag_k,
@@ -232,12 +234,14 @@ def _init_session_state() -> None:
         "_pending_rag_reset": False,
         "_pending_rag_index": False,
         SIDEBAR_UPLOAD_KEY: [],
-        CHAT_FILE_UPLOAD_KEY: None,
     }
 
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+    if CHAT_FILE_BUFFER_KEY not in st.session_state:
+        st.session_state[CHAT_FILE_BUFFER_KEY] = []
 
 
 def _reset_chat() -> None:
@@ -251,7 +255,7 @@ def _reset_chat() -> None:
     st.session_state.chat_doc_metas = []
     st.session_state.chat_doc_index = None
     st.session_state.chat_doc_embedding_model = EMBEDDING_MODEL
-    st.session_state[CHAT_FILE_UPLOAD_KEY] = None
+    st.session_state[CHAT_FILE_BUFFER_KEY] = []
     st.session_state["_chat_file_warning"] = []
 
 
@@ -626,7 +630,11 @@ def _delete_remote_file(file_id: Optional[str]) -> None:
 def _add_chat_attachments(files: Optional[Sequence[UploadedFile]]) -> None:
     """Persist uploaded files/images as pending chat attachments."""
 
-    if not files:
+    if files:
+        st.session_state[CHAT_FILE_BUFFER_KEY] = list(files)
+
+    pending_files = list(st.session_state.get(CHAT_FILE_BUFFER_KEY, []))
+    if not pending_files:
         return
 
     attachments = list(st.session_state.get("chat_attachments", []))
@@ -641,7 +649,7 @@ def _add_chat_attachments(files: Optional[Sequence[UploadedFile]]) -> None:
     processed = False
     client: Optional[OpenAI] = None
 
-    for upload in files:
+    for upload in pending_files:
         if upload is None:
             continue
         processed = True
@@ -703,7 +711,7 @@ def _add_chat_attachments(files: Optional[Sequence[UploadedFile]]) -> None:
         st.session_state.chat_attachments = attachments
         st.session_state.chat_images = images
         st.session_state["_chat_file_warning"] = warnings
-        st.session_state[CHAT_FILE_UPLOAD_KEY] = None
+        st.session_state[CHAT_FILE_BUFFER_KEY] = []
 
 
 def _activate_pending_chat_documents(client: OpenAI) -> None:
@@ -1575,7 +1583,7 @@ def _render_chat_interface() -> None:
                 "Importer des fichiers ou images",
                 type=CHAT_FILE_EXTENSIONS,
                 accept_multiple_files=True,
-                key=CHAT_FILE_UPLOAD_KEY,
+                key=CHAT_FILE_UPLOAD_WIDGET_KEY,
             )
             help_hint = (
                 f"Limite {DEFAULT_MAX_FILE_MB} Mo par fichier • Docs : CSV, TSV, XLSX, XLS, PDF, DOCX, TXT, MD, JSON/NDJSON"
